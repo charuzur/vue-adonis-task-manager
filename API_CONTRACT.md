@@ -1,7 +1,7 @@
 # API Contract & Data Model
 
 ## The Task Object
-This is the exact JSON structure the AdonisJS backend will return and expect. Dummy data below was used in building the Vue UI immediately.
+This is the exact JSON structure the AdonisJS backend will return and expect. Dummy data below will be used in building the Vue UI immediately.
 
 ```json
 {
