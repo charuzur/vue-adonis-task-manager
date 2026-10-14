@@ -28,12 +28,13 @@ export default class TasksController {
 
   // PATCH
   async update({ params, request }: HttpContext) {
-    const task  = await Task.findOrFail(params.id)
-    const {due_date, ...fields} = await request.validateUsing(updateTaskValidator)
+    const task = await Task.findOrFail(params.id)
+
+    const { due_date, ...fields } = await request.validateUsing(updateTaskValidator)
 
     task.merge(fields)
     if (due_date !== undefined) {
-        task.dueDate = due_date
+      task.dueDate = due_date
     }
     await task.save()
 

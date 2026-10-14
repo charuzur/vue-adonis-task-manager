@@ -21,7 +21,7 @@ router
       .patch('tasks/:id', [TasksController, 'update'])
       .where('id', router.matchers.number())
   })
-  .prefix('/api/v1')
+
 
 // DELETE
 router.delete('/tasks/:id', [TasksController, 'destroy'])
