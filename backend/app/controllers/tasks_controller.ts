@@ -1,15 +1,29 @@
 import type { HttpContext } from '@adonisjs/core/http'
 import Task from '#models/task'
-import { updateTaskValidator } from '#validators/task'
+import {updateTaskValidator} from '#validators/task'
 
 export default class TasksController {
   // GET and POST
   async index({ response }: HttpContext) {
-    return response.ok({ message: 'GET endpoint ready' })
+    const tasks = await Task.query().orderBy('id', 'asc')
+    return response.ok(tasks)
   }
 
-  async store({ response }: HttpContext) {
-    return response.ok({ message: 'POST endpoint ready' })
+  async store({ request, response }: HttpContext) {
+    const payload = request.only(['title', 'description', 'due_date', 'priority', 'status'])
+
+    // Enforce API Contract
+    if (!payload.title) {
+      return response.badRequest({ message: 'Title is required' })
+    }
+
+    // Default status if none provided by the frontend
+    if (!payload.status) {
+      payload.status = 'To Do'
+    }
+
+    const task = await Task.create(payload)
+    return response.created(task)
   }
 
   // PATCH

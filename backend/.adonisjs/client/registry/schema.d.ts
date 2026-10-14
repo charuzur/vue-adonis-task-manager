@@ -33,6 +33,7 @@ export interface Registry {
   }
   'tasks.update': {
     methods: ["PATCH"]
+<<<<<<< HEAD
     pattern: '/api/v1/tasks/:id'
     types: {
       body: ExtractBody<InferInput<(typeof import('#validators/task').updateTaskValidator)>>
@@ -41,6 +42,16 @@ export interface Registry {
       query: ExtractQuery<InferInput<(typeof import('#validators/task').updateTaskValidator)>>
       response: ExtractResponse<Awaited<ReturnType<import('#controllers/tasks_controller').default['update']>>>
       errorResponse: ExtractErrorResponse<Awaited<ReturnType<import('#controllers/tasks_controller').default['update']>>> | { status: 422; response: { errors: SimpleError[] } }
+=======
+    pattern: '/tasks/:id'
+    types: {
+      body: {}
+      paramsTuple: [ParamValue]
+      params: { id: ParamValue }
+      query: {}
+      response: ExtractResponse<Awaited<ReturnType<import('#controllers/tasks_controller').default['update']>>>
+      errorResponse: ExtractErrorResponse<Awaited<ReturnType<import('#controllers/tasks_controller').default['update']>>>
+>>>>>>> main
     }
   }
   'tasks.destroy': {
