@@ -63,8 +63,7 @@ export default class TasksController {
     try {
       const task = await Task.findOrFail(params.id)
 
-      // SECURITY: Ensure the task belongs to the authenticated user
-      // Uncomment if tasks are scoped to users:
+      // TODO: Uncomment once task ownership is implemented
       // if (task.userId !== auth.user!.id) {
       //   return response.unauthorized({ message: 'You do not have permission to delete this task' })
       // }
@@ -72,7 +71,7 @@ export default class TasksController {
       await task.delete()
 
       return response.ok({
-        message: 'Task successfully deleted',
+        message: 'Task deleted',
         taskId: task.id,
       })
     } catch (error) {
