@@ -35,12 +35,12 @@ export interface Registry {
     methods: ["PATCH"]
     pattern: '/tasks/:id'
     types: {
-      body: {}
+      body: ExtractBody<InferInput<(typeof import('#validators/task').updateTaskValidator)>>
       paramsTuple: [ParamValue]
       params: { id: ParamValue }
-      query: {}
+      query: ExtractQuery<InferInput<(typeof import('#validators/task').updateTaskValidator)>>
       response: ExtractResponse<Awaited<ReturnType<import('#controllers/tasks_controller').default['update']>>>
-      errorResponse: ExtractErrorResponse<Awaited<ReturnType<import('#controllers/tasks_controller').default['update']>>>
+      errorResponse: ExtractErrorResponse<Awaited<ReturnType<import('#controllers/tasks_controller').default['update']>>> | { status: 422; response: { errors: SimpleError[] } }
     }
   }
   'tasks.destroy': {

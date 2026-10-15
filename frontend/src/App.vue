@@ -42,6 +42,17 @@ const showToast = (type, text) => {
 }
 
 // GET: fetch tasks with the active filters 
+const statuses = ['To Do', 'In Progress', 'Completed']
+const editingId = ref(null)
+const editForm = ref({ 
+  title: '',
+  description: '', 
+  dueDate: '', 
+  priority: '' 
+})
+
+
+// GET: Fetch tasks from AdonisJS
 const fetchTasks = async () => {
   loading.value = true
   fetchError.value = ''
@@ -72,6 +83,63 @@ const clearFilters = () => {
 watch(filters, fetchTasks, { deep: true })
 
 // POST: send new task to AdonisJS 
+// PATCH: Update task status or details
+
+const updateTask = async (taskId, updatedData) => {
+  try {
+    const response = await fetch(`http://localhost:3333/tasks/${taskId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(updatedData)
+    })
+
+    if (!response.ok) {
+      alert('Failed to update task. Please try again.')
+      return false
+    }
+
+    await fetchTasks() // Refresh tasks after update
+    return true
+  } catch (error) {
+    console.error('Error updating task:', error)
+    alert('Could not reach the server.')
+    return false
+  }
+}
+
+const changeStatus = async (task, status) => {
+  const ok = await updateTask(task.id, { status })
+  if (!ok) fetchTasks() // reset the dropdown to the saved value
+}
+
+const startEdit = (task) => {
+  editingId.value = task.id
+  editForm.value = {
+    title: task.title,
+    description: task.description || '',
+    dueDate: (task.due_date || task.dueDate || '').split('T')[0],
+    priority: task.priority || ''
+  }
+}
+
+const cancelEdit = () => {
+  editingId.value = null
+}
+
+const saveEdit = async (taskId) => {
+  if (!editForm.value.title.trim()) return alert('Title is required')
+
+  const ok = await updateTask(taskId, {
+    title: editForm.value.title,
+    description: editForm.value.description,
+    due_date: editForm.value.dueDate || null,
+    priority: editForm.value.priority || null
+  })
+
+  if (ok) cancelEdit()
+}
+
+// POST: Send new task to AdonisJS
 const submitTask = async () => {
   if (!newTask.value.title) return alert('Title is required')
 
@@ -90,6 +158,10 @@ const submitTask = async () => {
     if (!response.ok) {
       const body = await response.json().catch(() => null)
       throw new Error(body?.message || `server responded with ${response.status}`)
+      const errorBody = await response.text()
+      console.error('PATCH failed:', response.status, errorBody)
+      alert(`Failed to update task (${response.status}). Check the console.`)
+      return false
     }
 
     // Clear form and refresh board (under the current filters)
@@ -155,6 +227,7 @@ const confirmDelete = async () => {
 const onKeydown = (event) => {
   if (event.key === 'Escape') closeDeleteModal()
 }
+
 
 // Load tasks when the page loads
 onMounted(() => {
@@ -288,10 +361,11 @@ onBeforeUnmount(() => {
               <span v-if="task.due_date || task.dueDate">
                 Due: <strong class="text-gray-900">{{ (task.due_date || task.dueDate).split('T')[0] }}</strong>
               </span>
-            </div>
-          </div>
+            </div>  
+          </div>      
 
           <!-- Right Side: Action Area for Teammates -->
+
           <div class="mt-4 sm:mt-0 sm:ml-4 flex gap-2">
             <!-- Teammate 1 will add Edit/Status dropdown here -->
 
@@ -308,6 +382,44 @@ onBeforeUnmount(() => {
               </svg>
               Delete
             </button>
+            <!-- Edit/Status (PATCH) -->
+            <div v-if="editingId !== task.id" class="flex gap-2 items-start">
+              <select
+                :value="task.status"
+                @change="changeStatus(task, $event.target.value)"
+                class="border border-gray-300 rounded-lg p-1.5 text-xs focus:ring-blue-500 focus:border-blue-500"
+              >
+                <option v-for="s in statuses" :key="s" :value="s">{{ s }}</option>
+              </select>
+              <button
+                @click="startEdit(task)"
+                class="text-xs font-medium px-3 py-1.5 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100"
+              >
+                Edit
+              </button>
+            </div>
+
+            <div v-else class="w-full sm:w-64 space-y-2">
+              <input v-model="editForm.title" type="text" placeholder="Title"
+                class="block w-full border border-gray-300 rounded-lg p-1.5 text-sm" />
+              <textarea v-model="editForm.description" rows="2" placeholder="Description"
+                class="block w-full border border-gray-300 rounded-lg p-1.5 text-sm"></textarea>
+              <input v-model="editForm.dueDate" type="date"
+                class="block w-full border border-gray-300 rounded-lg p-1.5 text-sm" />
+              <select v-model="editForm.priority"
+                class="block w-full border border-gray-300 rounded-lg p-1.5 text-sm">
+                <option value="">No priority</option>
+                <option value="Low">Low</option>
+                <option value="Medium">Medium</option>
+                <option value="High">High</option>
+              </select>
+              <div class="flex justify-end gap-2">
+                <button @click="cancelEdit" class="text-xs px-3 py-1.5 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100">Cancel</button>
+                <button @click="saveEdit(task.id)" class="text-xs px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700">Save</button>
+              </div>
+            </div>
+
+            <!-- Teammate 2 will add Delete button here -->
           </div>
 
         </div>
