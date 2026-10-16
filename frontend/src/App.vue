@@ -250,7 +250,7 @@ const changeStatus = async (task, status) => {
 }
 
 /**
- * Open the inline edit form for one task. We copy the task into editForm
+ * Open the edit modal for one task. We copy the task into editForm
  * (instead of binding the inputs to the task itself) so that Cancel can throw
  * the changes away without touching the list.
  */
@@ -323,7 +323,10 @@ const saveEdit = async (taskId) => {
     })
 
     if (ok) {
-      cancelEdit()
+      // Close directly: cancelEdit() would hit its "still saving" guard here
+      // because savingEdit is only reset in this function's finally block.
+      editingId.value = null
+      editError.value = ''
       showToast('success', 'Task updated')
     }
   } finally {
