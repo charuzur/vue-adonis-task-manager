@@ -15,9 +15,16 @@ router.get('/tasks', [TasksController, 'index'])
 router.post('/tasks', [TasksController, 'store'])
 
 // PATCH
-router.group(() => {
-  router.patch('tasks/:id', [TasksController, 'update']).where('id', router.matchers.number())
-})
+router 
+  .group(() => {
+    router
+      .patch('tasks/:id', [TasksController, 'update'])
+      .where('id', router.matchers.number())
+  })
+
 
 // DELETE
 router.delete('/tasks/:id', [TasksController, 'destroy'])
+
+
+
