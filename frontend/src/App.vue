@@ -5,7 +5,7 @@ const API = 'http://localhost:3333'
 const STATUSES = ['To Do', 'In Progress', 'Completed']
 const PRIORITIES = ['Low', 'Medium', 'High']
 
-//  Reactive state 
+// Reactive state
 const tasks = ref([])
 const newTask = ref({ title: '', description: '', dueDate: '', priority: '' })
 
@@ -41,7 +41,7 @@ const taskToDelete = ref(null)
 const deleting = ref(false)
 const deleteError = ref('')
 
-//  Helpers 
+// Helpers
 const toastClass = computed(() => {
   if (toast.value?.type === 'success') return 'bg-green-50 border-green-200 text-green-800'
   if (toast.value?.type === 'info') return 'bg-blue-50 border-blue-200 text-blue-800'
@@ -182,7 +182,7 @@ const submitTask = async () => {
   }
 }
 
-//  PATCH: update a task 
+// PATCH: update a task
 const updateTask = async (taskId, data) => {
   try {
     const response = await fetch(`${API}/tasks/${taskId}`, {
@@ -268,7 +268,7 @@ const saveEdit = async () => {
   }
 }
 
-//  DELETE: safe delete 
+// DELETE: safe delete
 const requestDelete = (task) => {
   taskToDelete.value = task
   deleteError.value = ''
@@ -316,7 +316,7 @@ const confirmDelete = async () => {
   }
 }
 
-//  Keyboard shortcuts 
+// Keyboard shortcuts
 const onKeydown = (event) => {
   if (event.key !== 'Escape') return
   if (createModalOpen.value) closeCreateModal()
