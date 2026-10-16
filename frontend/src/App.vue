@@ -85,22 +85,18 @@ const isOverdue = (task) => {
   return Boolean(due) && task.status !== 'Completed' && due < todayString()
 }
 
-// A date is "in the past" if it is before today. Today itself is allowed.
+// Past = before today (today is allowed)
 const isPastDate = (dateString) => Boolean(dateString) && dateString < todayString()
 
-// Earliest date the edit form's date picker allows. Normally that's today, but
-// if the task's saved date is already past (an overdue task), that saved date
-// stays selectable so the user can still edit the title, etc. without being
-// forced to pick a new date. Moving the date to a different past day is blocked.
+// Earliest date the edit picker allows: today, or the task's own date if it's already overdue
 const editMinDate = computed(() =>
   isPastDate(editOriginalDue.value) ? editOriginalDue.value : todayString()
 )
 
-// Completed tasks are locked: no edits and no status changes (delete still works).
+// Completed tasks are read-only history: no edits, status changes or deletes
 const isLocked = (task) => task.status === 'Completed'
 
-// "2026-10-20" -> "Oct 20, 2026". Built from the parts (not new Date(string))
-// so the date never shifts by a day because of time zones.
+// "2026-10-20" -> "Oct 20, 2026" (built from parts to avoid time zone shifts)
 const formatDate = (dateString) => {
   if (!dateString) return ''
   const [year, month, day] = dateString.split('-').map(Number)
@@ -131,11 +127,10 @@ const statusBadge = (status) => {
 }
 
 // ---------------------------------------------------------------------------
-// Sorting and splitting (done in the browser, on top of the server filters)
+// Sorting (done in the browser, on top of the server filters)
 // ---------------------------------------------------------------------------
 
-// Soonest due date first. Tasks without a due date go to the bottom, and ties
-// are broken by title so the order is stable.
+// Soonest due date first, no date last, ties by title
 const compareByDueDate = (a, b) => {
   const dueA = getDueDate(a)
   const dueB = getDueDate(b)
@@ -145,14 +140,12 @@ const compareByDueDate = (a, b) => {
   return (a.title || '').localeCompare(b.title || '')
 }
 
-// Open work (To Do + In Progress), sorted by due date. filter() returns a new
-// array, so sorting it never mutates the original tasks list.
+// Open tasks (To Do + In Progress) by due date
 const activeTasks = computed(() =>
   tasks.value.filter((t) => t.status !== 'Completed').sort(compareByDueDate)
 )
 
-// Completed tasks act as a history: most recently updated first. Falls back to
-// due-date order if the API doesn't send updated_at.
+// Completed tasks as history: most recently updated first
 const updatedAt = (task) => Date.parse(task.updated_at || task.updatedAt || '') || 0
 const completedTasks = computed(() =>
   tasks.value
@@ -160,18 +153,14 @@ const completedTasks = computed(() =>
     .sort((a, b) => updatedAt(b) - updatedAt(a) || compareByDueDate(a, b))
 )
 
-const visibleTasks = computed(() =>
-  activeTab.value === 'completed' ? completedTasks.value : activeTasks.value
-)
+// With a filter applied, show one flat list of the matches; the tabs only exist
+// when no filter is applied.
+const visibleTasks = computed(() => {
+  if (hasActiveFilters.value) return [...tasks.value].sort(compareByDueDate)
+  return activeTab.value === 'completed' ? completedTasks.value : activeTasks.value
+})
 
-// Picking a status in the filter jumps to the tab where those tasks live.
-watch(
-  () => filters.value.status,
-  (status) => {
-    if (status === 'Completed') activeTab.value = 'completed'
-    else if (status === 'To Do' || status === 'In Progress') activeTab.value = 'active'
-  }
-)
+watch(hasActiveFilters, () => { activeTab.value = 'active' })
 
 // ---------------------------------------------------------------------------
 // GET: fetch tasks from AdonisJS using the active filters
@@ -209,60 +198,38 @@ watch(filters, fetchTasks, { deep: true })
 // PATCH: update a task's status or details
 // ---------------------------------------------------------------------------
 
-/**
- * Shared PATCH helper used by both the status dropdown and the edit form.
- *
- * PATCH (not PUT) is used on purpose: it is a *partial* update, so we only
- * send the fields that changed. For example, changing the status sends just
- * { status: 'Completed' } and leaves the title, description, etc. untouched.
- *
- * @param {number|string} taskId      - id of the task, used in the URL: /tasks/:id
- * @param {object}        updatedData - only the fields to change (API uses snake_case,
- *                                      e.g. due_date)
- * @returns {Promise<boolean>} true if the server saved the change, false otherwise,
- *                             so callers can decide what to do next (close the edit
- *                             form, reset the dropdown, etc.)
- */
+// Shared PATCH helper for the status dropdown and the edit form.
+// PATCH is a partial update, so only the changed fields are sent (snake_case keys).
+// Returns true if the server saved the change.
 const updateTask = async (taskId, updatedData) => {
   try {
     const response = await fetch(`${API}/tasks/${taskId}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' }, // tells AdonisJS the body is JSON
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(updatedData)
     })
 
-    // fetch() only throws on network failures. HTTP errors such as 404 (task
-    // not found) or 422 (validation failed) still resolve, so check response.ok.
+    // HTTP errors (404, 422) don't throw, so check response.ok
     if (!response.ok) {
-      // Try to show the server's own message (e.g. a validation error). The body
-      // might not be JSON, so fall back to a generic message with the status code.
       const errorBody = await response.json().catch(() => null)
       showToast('error', errorBody?.message || `Failed to update task (${response.status}).`)
       return false
     }
 
-    // Refetch instead of patching the local copy, so the list always matches the
-    // database and still respects the current filters. For example, marking a task
-    // "Completed" while filtering by "To Do" should make it disappear from view.
-    // The task also moves between the open list and "Completed tasks" automatically,
-    // because those lists are computed from the refreshed data.
+    // Refetch so the list matches the database and the current filters
     await fetchTasks()
     return true
   } catch (error) {
-    // Network-level failure: the backend is down or unreachable.
+    // Network failure (backend down)
     console.error('Error updating task:', error)
     showToast('error', 'Could not reach the server.')
     return false
   }
 }
 
-/**
- * Status dropdown handler. Sends only the new status in the PATCH body.
- * If the save fails, refetch so the dropdown snaps back to the saved value
- * instead of showing a status that was never stored.
- */
+// Status dropdown: PATCH only the new status
 const changeStatus = async (task, status) => {
-  // Completed tasks are locked. The dropdown is hidden for them, but guard anyway.
+  // Completed tasks are read-only
   if (isLocked(task)) {
     showToast('error', 'Completed tasks can’t be changed.')
     return
@@ -273,13 +240,9 @@ const changeStatus = async (task, status) => {
   else fetchTasks() // reset the dropdown to the saved value
 }
 
-/**
- * Open the inline edit form for one task. We copy the task into editForm
- * (instead of binding the inputs to the task itself) so that Cancel can throw
- * the changes away without touching the list.
- */
+// Copy the task into editForm so Cancel can discard changes
 const startEdit = (task) => {
-  // Completed tasks can't be edited (the Edit button is hidden for them too)
+  // Completed tasks are read-only
   if (isLocked(task)) {
     showToast('error', 'Completed tasks can’t be edited.')
     return
@@ -299,30 +262,20 @@ const cancelEdit = () => {
   editingId.value = null
 }
 
-/**
- * Save the edit form. Unlike the status dropdown, this sends all the editable
- * fields in one PATCH request.
- *
- * - The API expects snake_case, so dueDate is sent as due_date.
- * - Empty date or priority is sent as null (not ""), so the database clears the
- *   value rather than storing an empty string that would fail date validation.
- * - The edit form only closes when the save succeeded, so the user's changes
- *   aren't lost if the request fails.
- */
+// Save the edit form in one PATCH. Empty date/priority are sent as null so the
+// database clears them. The form stays open if the save fails.
 const saveEdit = async (taskId) => {
-  // Completed tasks are locked, so never send a PATCH for them
+  // Completed tasks are read-only
   const current = tasks.value.find((t) => t.id === taskId)
   if (current && isLocked(current)) {
     return showToast('error', 'Completed tasks can’t be edited.')
   }
 
-  // Client-side checks first so we don't send a request that will be rejected
   if (!editForm.value.title.trim()) {
     return showToast('error', 'Title is required')
   }
 
-  // No moving a due date into the past. Keeping the task's existing (already
-  // past) date is fine, so overdue tasks can still be edited.
+  // Block new past dates (keeping an existing overdue date is fine)
   if (isPastDate(editForm.value.dueDate) && editForm.value.dueDate !== editOriginalDue.value) {
     return showToast('error', 'Due date can’t be in the past. Pick today or a later date.')
   }
@@ -368,8 +321,7 @@ const submitTask = async () => {
     return
   }
 
-  // New tasks can be due today or later, never in the past. The date picker's
-  // min attribute blocks this too, but typing a date by hand can bypass it.
+  // Typing a date by hand can bypass the picker's min
   if (isPastDate(newTask.value.dueDate)) {
     addError.value = 'Due date can’t be in the past. Pick today or a later date.'
     return
@@ -395,8 +347,6 @@ const submitTask = async () => {
       throw new Error(body?.message || `server responded with ${response.status}`)
     }
 
-    // Success: close the modal, show the new task in the open list, and refresh
-    // (under the current filters)
     showAddModal.value = false
     resetNewTask()
     activeTab.value = 'active'
@@ -415,6 +365,7 @@ const submitTask = async () => {
 // DELETE: safe delete (confirmation modal)
 // ---------------------------------------------------------------------------
 const requestDelete = (task) => {
+  if (isLocked(task)) return // completed tasks are kept as history
   taskToDelete.value = task
   deleteError.value = ''
 }
@@ -543,8 +494,8 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <!-- Tabs: open tasks vs. Completed tasks (history) -->
-          <div class="flex gap-1 rounded-lg bg-violet-100/70 p-1" role="tablist" aria-label="Task lists">
+          <!-- Tabs: only when no filter is applied -->
+          <div v-if="!hasActiveFilters" class="flex gap-1 rounded-lg bg-violet-100/70 p-1" role="tablist" aria-label="Task lists">
             <button
               type="button"
               role="tab"
@@ -563,7 +514,7 @@ onBeforeUnmount(() => {
               class="flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500"
               :class="activeTab === 'completed' ? 'bg-white text-violet-700 shadow-sm' : 'text-gray-600 hover:text-violet-700'"
             >
-              Completed tasks <span class="ml-1 text-xs font-semibold opacity-70">{{ completedTasks.length }}</span>
+              Completed Tasks <span class="ml-1 text-xs font-semibold opacity-70">{{ completedTasks.length }}</span>
             </button>
           </div>
         </div>
@@ -645,22 +596,9 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <!-- Right side: actions (status dropdown, Edit, Delete) -->
-              <div class="flex flex-wrap items-center gap-2 sm:flex-nowrap">
-                <!-- Completed tasks are locked: no status dropdown and no Edit button -->
-                <span
-                  v-if="isLocked(task)"
-                  class="inline-flex items-center gap-1 rounded-lg bg-violet-50 px-2.5 py-1.5 text-xs font-medium text-violet-700"
-                  title="Completed tasks can't be edited"
-                >
-                  <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
-                    <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd" />
-                  </svg>
-                  Locked
-                </span>
-
+              <!-- Actions (completed tasks are read-only history, so none) -->
+              <div v-if="!isLocked(task)" class="flex flex-wrap items-center gap-2 sm:flex-nowrap">
                 <select
-                  v-if="!isLocked(task)"
                   :value="task.status"
                   @change="changeStatus(task, $event.target.value)"
                   :aria-label="`Change status of ${task.title}`"
@@ -670,7 +608,6 @@ onBeforeUnmount(() => {
                 </select>
 
                 <button
-                  v-if="!isLocked(task)"
                   type="button"
                   @click="startEdit(task)"
                   class="rounded-lg border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:bg-violet-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500"
@@ -678,7 +615,6 @@ onBeforeUnmount(() => {
                   Edit
                 </button>
 
-                <!-- Safe delete: opens the confirmation modal -->
                 <button
                   type="button"
                   @click="requestDelete(task)"
@@ -770,9 +706,7 @@ onBeforeUnmount(() => {
             v-if="!loading && !fetchError && visibleTasks.length === 0"
             class="rounded-xl border border-dashed border-violet-200 bg-violet-50/40 px-4 py-10 text-center"
           >
-            <p v-if="hasActiveFilters" class="text-gray-500">
-              {{ activeTab === 'completed' ? 'No completed tasks match your filters.' : 'No tasks match your filters.' }}
-            </p>
+            <p v-if="hasActiveFilters" class="text-gray-500">No tasks match your filters.</p>
             <p v-else-if="activeTab === 'completed'" class="text-gray-500">
               No completed tasks yet. Tasks you finish will show up here.
             </p>
