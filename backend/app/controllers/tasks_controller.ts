@@ -1,7 +1,7 @@
 import type { HttpContext } from '@adonisjs/core/http'
 import Task from '#models/task'
 import { DateTime } from 'luxon'
-import {updateTaskValidator} from '#validators/task'
+import { updateTaskValidator } from '#validators/task'
 
 export default class TasksController {
   /**
@@ -98,4 +98,3 @@ export default class TasksController {
     }
   }
 }
-
