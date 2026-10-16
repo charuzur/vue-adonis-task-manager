@@ -32,7 +32,8 @@ const activeTab = ref('active') // 'active' | 'completed'
 // "Add task" modal
 const showAddModal = ref(false)
 const saving = ref(false)
-const addError = ref('')
+const addTitleError = ref('')
+const addDateError = ref('')
 const newTitleInput = ref(null)
 
 // Safe delete flow
@@ -40,7 +41,7 @@ const taskToDelete = ref(null)
 const deleting = ref(false)
 const deleteError = ref('')
 
-// Inline edit state
+// Edit task modal (PATCH)
 const statuses = ['To Do', 'In Progress', 'Completed']
 const editingId = ref(null)
 const editForm = ref({
@@ -50,6 +51,9 @@ const editForm = ref({
   priority: ''
 })
 const editOriginalDue = ref('') // due date when the edit started (see isPastDate rule)
+const editError = ref('') // inline validation message inside the edit modal
+const savingEdit = ref(false) // true while the PATCH request is in flight
+const editTitleInput = ref(null) // template ref, focused when the modal opens
 
 // ---------------------------------------------------------------------------
 // Display helpers
@@ -234,10 +238,15 @@ const updateTask = async (taskId, updatedData) => {
     // fetch() only throws on network failures. HTTP errors such as 404 (task
     // not found) or 422 (validation failed) still resolve, so check response.ok.
     if (!response.ok) {
-      // Try to show the server's own message (e.g. a validation error). The body
-      // might not be JSON, so fall back to a generic message with the status code.
+      // Try to show the server's own message. Vine validation errors (422) come
+      // back as { errors: [{ message }] }, other failures as { message } or
+      // { error }. The body might not be JSON at all, so fall back to a generic
+      // message with the status code.
       const errorBody = await response.json().catch(() => null)
-      showToast('error', errorBody?.message || `Failed to update task (${response.status}).`)
+      const serverMessage = Array.isArray(errorBody?.errors)
+        ? errorBody.errors.map((entry) => entry.message).join(' ')
+        : errorBody?.message || errorBody?.error
+      showToast('error', serverMessage || `Failed to update task (${response.status}).`)
       return false
     }
 
@@ -274,17 +283,18 @@ const changeStatus = async (task, status) => {
 }
 
 /**
- * Open the inline edit form for one task. We copy the task into editForm
- * (instead of binding the inputs to the task itself) so that Cancel can throw
- * the changes away without touching the list.
+ * Open the edit modal for one task. We copy the task into editForm (instead of
+ * binding the inputs to the task itself) so that Cancel can throw the changes
+ * away without touching the list.
  */
-const startEdit = (task) => {
+const startEdit = async (task) => {
   // Completed tasks can't be edited (the Edit button is hidden for them too)
   if (isLocked(task)) {
     showToast('error', 'Completed tasks can’t be edited.')
     return
   }
 
+  editError.value = ''
   editingId.value = task.id
   editOriginalDue.value = getDueDate(task)
   editForm.value = {
@@ -293,23 +303,31 @@ const startEdit = (task) => {
     dueDate: getDueDate(task), // <input type="date"> needs "YYYY-MM-DD"
     priority: task.priority || ''
   }
+
+  // Start typing right away, same as the "Add task" modal
+  await nextTick()
+  editTitleInput.value?.focus()
 }
 
 const cancelEdit = () => {
+  if (savingEdit.value) return // block closing while the request is in flight
   editingId.value = null
+  editError.value = ''
 }
 
 /**
- * Save the edit form. Unlike the status dropdown, this sends all the editable
+ * Save the edit modal. Unlike the status dropdown, this sends all the editable
  * fields in one PATCH request.
  *
  * - The API expects snake_case, so dueDate is sent as due_date.
  * - Empty date or priority is sent as null (not ""), so the database clears the
  *   value rather than storing an empty string that would fail date validation.
- * - The edit form only closes when the save succeeded, so the user's changes
- *   aren't lost if the request fails.
+ * - The modal only closes when the save succeeded, so the user's changes aren't
+ *   lost if the request fails.
  */
 const saveEdit = async (taskId) => {
+  if (savingEdit.value) return
+
   // Completed tasks are locked, so never send a PATCH for them
   const current = tasks.value.find((t) => t.id === taskId)
   if (current && isLocked(current)) {
@@ -317,26 +335,34 @@ const saveEdit = async (taskId) => {
   }
 
   // Client-side checks first so we don't send a request that will be rejected
+  editError.value = ''
   if (!editForm.value.title.trim()) {
-    return showToast('error', 'Title is required')
+    editError.value = 'Title is required'
+    return
   }
 
   // No moving a due date into the past. Keeping the task's existing (already
   // past) date is fine, so overdue tasks can still be edited.
   if (isPastDate(editForm.value.dueDate) && editForm.value.dueDate !== editOriginalDue.value) {
-    return showToast('error', 'Due date can’t be in the past. Pick today or a later date.')
+    editError.value = 'Due date can’t be in the past. Pick today or a later date.'
+    return
   }
 
-  const ok = await updateTask(taskId, {
-    title: editForm.value.title.trim(),
-    description: editForm.value.description,
-    due_date: editForm.value.dueDate || null,
-    priority: editForm.value.priority || null
-  })
+  savingEdit.value = true
+  try {
+    const ok = await updateTask(taskId, {
+      title: editForm.value.title.trim(),
+      description: editForm.value.description,
+      due_date: editForm.value.dueDate || null,
+      priority: editForm.value.priority || null
+    })
 
-  if (ok) {
-    cancelEdit()
-    showToast('success', 'Task updated')
+    if (ok) {
+      cancelEdit()
+      showToast('success', 'Task updated')
+    }
+  } finally {
+    savingEdit.value = false
   }
 }
 
@@ -345,7 +371,8 @@ const saveEdit = async (taskId) => {
 // ---------------------------------------------------------------------------
 const resetNewTask = () => {
   newTask.value = { title: '', description: '', dueDate: '', priority: '' }
-  addError.value = ''
+  addTitleError.value = ''
+  addDateError.value = ''
 }
 
 const openAddModal = async () => {
@@ -364,19 +391,20 @@ const closeAddModal = () => {
 const submitTask = async () => {
   if (saving.value) return
   if (!newTask.value.title.trim()) {
-    addError.value = 'Title is required'
+    addTitleError.value = 'Title is required'
     return
   }
 
   // New tasks can be due today or later, never in the past. The date picker's
   // min attribute blocks this too, but typing a date by hand can bypass it.
   if (isPastDate(newTask.value.dueDate)) {
-    addError.value = 'Due date can’t be in the past. Pick today or a later date.'
+    addDateError.value = 'Due date can’t be in the past. Pick today or a later date.'
     return
   }
 
   saving.value = true
-  addError.value = ''
+  addTitleError.value = ''
+  addDateError.value = ''
 
   try {
     const response = await fetch(`${API}/tasks`, {
@@ -404,7 +432,7 @@ const submitTask = async () => {
     await fetchTasks()
   } catch (error) {
     // Keep the modal open so the user's input isn't lost
-    addError.value = `Could not save the task: ${error.message}`
+    addTitleError.value = `Could not save the task: ${error.message}`
     console.error('Error creating task:', error)
   } finally {
     saving.value = false
@@ -467,6 +495,7 @@ const onKeydown = (event) => {
   if (event.key !== 'Escape') return
   if (taskToDelete.value) closeDeleteModal()
   else if (showAddModal.value) closeAddModal()
+  else if (editingId.value !== null) cancelEdit()
 }
 
 // Load tasks when the page loads
@@ -595,8 +624,8 @@ onBeforeUnmount(() => {
             class="rounded-xl border-l-4 bg-white p-4 shadow-sm ring-1 ring-violet-100 transition-shadow hover:shadow-md"
             :class="[priorityBorder(task.priority), task.status === 'Completed' ? 'opacity-75' : '']"
           >
-            <!-- View mode -->
-            <div v-if="editingId !== task.id" class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+            <!-- Task data (the edit form now lives in a modal) -->
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
               <!-- Left side: task data -->
               <div class="min-w-0 flex-1">
                 <div class="flex flex-wrap items-center gap-2">
@@ -694,75 +723,6 @@ onBeforeUnmount(() => {
               </div>
             </div>
 
-            <!-- Edit mode: full-width inline form (PATCH) -->
-            <div v-else class="space-y-3">
-              <h3 class="text-sm font-semibold text-gray-800">Edit task</h3>
-
-              <div>
-                <label :for="`edit-title-${task.id}`" class="mb-1 block text-xs font-medium text-gray-600">Title</label>
-                <input
-                  :id="`edit-title-${task.id}`"
-                  v-model="editForm.title"
-                  type="text"
-                  placeholder="Title"
-                  class="block w-full rounded-lg border border-gray-300 p-2 text-sm focus:border-violet-500 focus:ring-violet-500"
-                />
-              </div>
-
-              <div>
-                <label :for="`edit-desc-${task.id}`" class="mb-1 block text-xs font-medium text-gray-600">Description</label>
-                <textarea
-                  :id="`edit-desc-${task.id}`"
-                  v-model="editForm.description"
-                  rows="2"
-                  placeholder="Description"
-                  class="block w-full rounded-lg border border-gray-300 p-2 text-sm focus:border-violet-500 focus:ring-violet-500"
-                ></textarea>
-              </div>
-
-              <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                <div>
-                  <label :for="`edit-due-${task.id}`" class="mb-1 block text-xs font-medium text-gray-600">Due date</label>
-                  <input
-                    :id="`edit-due-${task.id}`"
-                    v-model="editForm.dueDate"
-                    type="date"
-                    :min="editMinDate"
-                    class="block w-full rounded-lg border border-gray-300 p-2 text-sm focus:border-violet-500 focus:ring-violet-500"
-                  />
-                </div>
-                <div>
-                  <label :for="`edit-priority-${task.id}`" class="mb-1 block text-xs font-medium text-gray-600">Priority</label>
-                  <select
-                    :id="`edit-priority-${task.id}`"
-                    v-model="editForm.priority"
-                    class="block w-full rounded-lg border border-gray-300 p-2 text-sm focus:border-violet-500 focus:ring-violet-500"
-                  >
-                    <option value="">No priority</option>
-                    <option value="Low">Low</option>
-                    <option value="Medium">Medium</option>
-                    <option value="High">High</option>
-                  </select>
-                </div>
-              </div>
-
-              <div class="flex justify-end gap-2 pt-1">
-                <button
-                  type="button"
-                  @click="cancelEdit"
-                  class="rounded-lg border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-violet-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  @click="saveEdit(task.id)"
-                  class="rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white shadow-sm hover:bg-violet-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2"
-                >
-                  Save changes
-                </button>
-              </div>
-            </div>
           </div>
 
           <!-- Empty states -->
@@ -827,10 +787,16 @@ onBeforeUnmount(() => {
               ref="newTitleInput"
               v-model="newTask.title"
               type="text"
-              required
-              class="block w-full rounded-lg border border-gray-300 p-2.5 transition-colors focus:border-violet-500 focus:ring-violet-500"
+              @input="addTitleError = ''"
+              aria-describedby="new-title-error"
+              :aria-invalid="Boolean(addTitleError)"
+              class="block w-full rounded-lg border transition-colors p-2.5 focus:ring-1"
+              :class="addTitleError ? 'border-red-300 focus:border-red-500 focus:ring-red-500' : 'border-gray-300 focus:border-violet-500 focus:ring-violet-500'"
               placeholder="What needs to be done?"
             />
+            <p v-if="addTitleError" id="new-title-error" class="mt-1 text-xs text-red-600" role="alert">
+              {{ addTitleError }}
+            </p>
           </div>
 
           <div>
@@ -852,8 +818,14 @@ onBeforeUnmount(() => {
                 v-model="newTask.dueDate"
                 type="date"
                 :min="todayString()"
-                class="block w-full rounded-lg border border-gray-300 p-2.5 transition-colors focus:border-violet-500 focus:ring-violet-500"
+                @input="addDateError = ''"
+                aria-describedby="new-due-error"
+                class="block w-full rounded-lg border transition-colors p-2.5 focus:ring-1"
+                :class="addDateError ? 'border-red-300 focus:border-red-500 focus:ring-red-500' : 'border-gray-300 focus:border-violet-500 focus:ring-violet-500'"
               />
+              <p v-if="addDateError" id="new-due-error" class="mt-1 text-xs text-red-600" role="alert">
+                {{ addDateError }}
+              </p>
             </div>
             <div>
               <label for="new-priority" class="mb-1 block text-sm font-medium text-gray-700">Priority</label>
@@ -870,10 +842,6 @@ onBeforeUnmount(() => {
             </div>
           </div>
 
-          <p v-if="addError" class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
-            {{ addError }}
-          </p>
-
           <div class="flex justify-end gap-3 pt-1">
             <button
               type="button"
@@ -889,6 +857,102 @@ onBeforeUnmount(() => {
               class="rounded-lg bg-violet-600 px-5 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-violet-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {{ saving ? 'Saving…' : 'Save task' }}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Edit task modal -->
+    <div
+      v-if="editingId !== null"
+      class="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-3 sm:items-center sm:p-4"
+      @click.self="cancelEdit"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="edit-task-title"
+    >
+      <div class="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl bg-white p-5 shadow-xl sm:p-6">
+        <h2 id="edit-task-title" class="text-lg font-semibold text-gray-900">Edit task</h2>
+
+        <form @submit.prevent="saveEdit(editingId)" class="mt-4 space-y-4">
+          <div>
+            <label for="edit-title" class="mb-1 block text-sm font-medium text-gray-700">
+              Task title <span class="text-red-500" aria-hidden="true">*</span>
+            </label>
+            <input
+              id="edit-title"
+              ref="editTitleInput"
+              v-model="editForm.title"
+              type="text"
+              :disabled="savingEdit"
+              @input="editError = ''"
+              aria-describedby="edit-error"
+              :aria-invalid="Boolean(editError)"
+              class="block w-full rounded-lg border transition-colors p-2.5 focus:ring-1 disabled:opacity-60"
+              :class="editError ? 'border-red-300 focus:border-red-500 focus:ring-red-500' : 'border-gray-300 focus:border-violet-500 focus:ring-violet-500'"
+              placeholder="What needs to be done?"
+            />
+            <p v-if="editError" id="edit-error" class="mt-1 text-xs text-red-600" role="alert">
+              {{ editError }}
+            </p>
+          </div>
+
+          <div>
+            <label for="edit-description" class="mb-1 block text-sm font-medium text-gray-700">Description</label>
+            <textarea
+              id="edit-description"
+              v-model="editForm.description"
+              rows="2"
+              :disabled="savingEdit"
+              class="block w-full rounded-lg border border-gray-300 p-2.5 transition-colors focus:border-violet-500 focus:ring-violet-500 disabled:opacity-60"
+              placeholder="Optional details..."
+            ></textarea>
+          </div>
+
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div>
+              <label for="edit-due" class="mb-1 block text-sm font-medium text-gray-700">Due date</label>
+              <input
+                id="edit-due"
+                v-model="editForm.dueDate"
+                type="date"
+                :min="editMinDate"
+                :disabled="savingEdit"
+                class="block w-full rounded-lg border border-gray-300 p-2.5 transition-colors focus:border-violet-500 focus:ring-violet-500 disabled:opacity-60"
+              />
+            </div>
+            <div>
+              <label for="edit-priority" class="mb-1 block text-sm font-medium text-gray-700">Priority</label>
+              <select
+                id="edit-priority"
+                v-model="editForm.priority"
+                :disabled="savingEdit"
+                class="block w-full rounded-lg border border-gray-300 p-2.5 transition-colors focus:border-violet-500 focus:ring-violet-500 disabled:opacity-60"
+              >
+                <option value="">No priority</option>
+                <option value="Low">Low</option>
+                <option value="Medium">Medium</option>
+                <option value="High">High</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="flex justify-end gap-3 pt-1">
+            <button
+              type="button"
+              @click="cancelEdit"
+              :disabled="savingEdit"
+              class="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-violet-50 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              :disabled="savingEdit"
+              class="rounded-lg bg-violet-600 px-5 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-violet-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {{ savingEdit ? 'Saving…' : 'Save changes' }}
             </button>
           </div>
         </form>
