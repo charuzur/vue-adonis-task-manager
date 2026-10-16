@@ -1,9 +1,11 @@
 <script setup>
-import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue'
 
 const API = 'http://localhost:3333'
 
+// ---------------------------------------------------------------------------
 // Reactive state
+// ---------------------------------------------------------------------------
 const tasks = ref([])
 const newTask = ref({
   title: '',
@@ -24,14 +26,37 @@ const fetchError = ref('')
 const toast = ref(null) // { type: 'success' | 'info' | 'error', text }
 let toastTimer = null
 
+// Which list the card is showing: open tasks, or the "Completed tasks" history
+const activeTab = ref('active') // 'active' | 'completed'
+
+// "Add task" modal
+const showAddModal = ref(false)
+const saving = ref(false)
+const addError = ref('')
+const newTitleInput = ref(null)
+
 // Safe delete flow
 const taskToDelete = ref(null)
 const deleting = ref(false)
 const deleteError = ref('')
 
+// Inline edit state
+const statuses = ['To Do', 'In Progress', 'Completed']
+const editingId = ref(null)
+const editForm = ref({
+  title: '',
+  description: '',
+  dueDate: '',
+  priority: ''
+})
+const editOriginalDue = ref('') // due date when the edit started (see isPastDate rule)
+
+// ---------------------------------------------------------------------------
+// Display helpers
+// ---------------------------------------------------------------------------
 const toastClass = computed(() => {
   if (toast.value?.type === 'success') return 'bg-green-50 border-green-200 text-green-800'
-  if (toast.value?.type === 'info') return 'bg-blue-50 border-blue-200 text-blue-800'
+  if (toast.value?.type === 'info') return 'bg-violet-50 border-violet-200 text-violet-800'
   return 'bg-red-50 border-red-200 text-red-800'
 })
 
@@ -41,18 +66,116 @@ const showToast = (type, text) => {
   toastTimer = setTimeout(() => { toast.value = null }, 4000)
 }
 
-// GET: fetch tasks with the active filters 
-const statuses = ['To Do', 'In Progress', 'Completed']
-const editingId = ref(null)
-const editForm = ref({ 
-  title: '',
-  description: '', 
-  dueDate: '', 
-  priority: '' 
-})
+// The API may return snake_case (due_date) or camelCase (dueDate), and the
+// value may be a full ISO timestamp. Normalize to "YYYY-MM-DD".
+const getDueDate = (task) => (task.due_date || task.dueDate || '').split('T')[0]
 
+// Today's date as "YYYY-MM-DD" in the user's local time zone, so it can be
+// compared directly (as a string) with the due date.
+const todayString = () => {
+  const d = new Date()
+  const month = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${d.getFullYear()}-${month}-${day}`
+}
 
-// GET: Fetch tasks from AdonisJS
+// A task is overdue when its due date has passed and it isn't completed yet.
+const isOverdue = (task) => {
+  const due = getDueDate(task)
+  return Boolean(due) && task.status !== 'Completed' && due < todayString()
+}
+
+// A date is "in the past" if it is before today. Today itself is allowed.
+const isPastDate = (dateString) => Boolean(dateString) && dateString < todayString()
+
+// Earliest date the edit form's date picker allows. Normally that's today, but
+// if the task's saved date is already past (an overdue task), that saved date
+// stays selectable so the user can still edit the title, etc. without being
+// forced to pick a new date. Moving the date to a different past day is blocked.
+const editMinDate = computed(() =>
+  isPastDate(editOriginalDue.value) ? editOriginalDue.value : todayString()
+)
+
+// Completed tasks are locked: no edits and no status changes (delete still works).
+const isLocked = (task) => task.status === 'Completed'
+
+// "2026-10-20" -> "Oct 20, 2026". Built from the parts (not new Date(string))
+// so the date never shifts by a day because of time zones.
+const formatDate = (dateString) => {
+  if (!dateString) return ''
+  const [year, month, day] = dateString.split('-').map(Number)
+  return new Date(year, month - 1, day).toLocaleDateString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric'
+  })
+}
+
+const priorityBorder = (priority) => {
+  if (priority === 'High') return 'border-red-500'
+  if (priority === 'Medium') return 'border-yellow-500'
+  if (priority === 'Low') return 'border-green-500'
+  return 'border-violet-200'
+}
+
+const priorityPill = (priority) => {
+  if (priority === 'High') return 'bg-red-50 text-red-700 ring-red-200'
+  if (priority === 'Medium') return 'bg-yellow-50 text-yellow-700 ring-yellow-200'
+  return 'bg-green-50 text-green-700 ring-green-200'
+}
+
+const statusBadge = (status) => {
+  if (status === 'In Progress') return 'bg-indigo-50 text-indigo-700 ring-indigo-200'
+  if (status === 'Completed') return 'bg-green-50 text-green-700 ring-green-200'
+  return 'bg-violet-50 text-violet-700 ring-violet-200'
+}
+
+// ---------------------------------------------------------------------------
+// Sorting and splitting (done in the browser, on top of the server filters)
+// ---------------------------------------------------------------------------
+
+// Soonest due date first. Tasks without a due date go to the bottom, and ties
+// are broken by title so the order is stable.
+const compareByDueDate = (a, b) => {
+  const dueA = getDueDate(a)
+  const dueB = getDueDate(b)
+  if (dueA && dueB && dueA !== dueB) return dueA < dueB ? -1 : 1
+  if (dueA && !dueB) return -1
+  if (!dueA && dueB) return 1
+  return (a.title || '').localeCompare(b.title || '')
+}
+
+// Open work (To Do + In Progress), sorted by due date. filter() returns a new
+// array, so sorting it never mutates the original tasks list.
+const activeTasks = computed(() =>
+  tasks.value.filter((t) => t.status !== 'Completed').sort(compareByDueDate)
+)
+
+// Completed tasks act as a history: most recently updated first. Falls back to
+// due-date order if the API doesn't send updated_at.
+const updatedAt = (task) => Date.parse(task.updated_at || task.updatedAt || '') || 0
+const completedTasks = computed(() =>
+  tasks.value
+    .filter((t) => t.status === 'Completed')
+    .sort((a, b) => updatedAt(b) - updatedAt(a) || compareByDueDate(a, b))
+)
+
+const visibleTasks = computed(() =>
+  activeTab.value === 'completed' ? completedTasks.value : activeTasks.value
+)
+
+// Picking a status in the filter jumps to the tab where those tasks live.
+watch(
+  () => filters.value.status,
+  (status) => {
+    if (status === 'Completed') activeTab.value = 'completed'
+    else if (status === 'To Do' || status === 'In Progress') activeTab.value = 'active'
+  }
+)
+
+// ---------------------------------------------------------------------------
+// GET: fetch tasks from AdonisJS using the active filters
+// ---------------------------------------------------------------------------
 const fetchTasks = async () => {
   loading.value = true
   fetchError.value = ''
@@ -82,42 +205,92 @@ const clearFilters = () => {
 // Re-query the API whenever any filter changes
 watch(filters, fetchTasks, { deep: true })
 
-// POST: send new task to AdonisJS 
-// PATCH: Update task status or details
+// ---------------------------------------------------------------------------
+// PATCH: update a task's status or details
+// ---------------------------------------------------------------------------
 
+/**
+ * Shared PATCH helper used by both the status dropdown and the edit form.
+ *
+ * PATCH (not PUT) is used on purpose: it is a *partial* update, so we only
+ * send the fields that changed. For example, changing the status sends just
+ * { status: 'Completed' } and leaves the title, description, etc. untouched.
+ *
+ * @param {number|string} taskId      - id of the task, used in the URL: /tasks/:id
+ * @param {object}        updatedData - only the fields to change (API uses snake_case,
+ *                                      e.g. due_date)
+ * @returns {Promise<boolean>} true if the server saved the change, false otherwise,
+ *                             so callers can decide what to do next (close the edit
+ *                             form, reset the dropdown, etc.)
+ */
 const updateTask = async (taskId, updatedData) => {
   try {
-    const response = await fetch(`http://localhost:3333/tasks/${taskId}`, {
+    const response = await fetch(`${API}/tasks/${taskId}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json' }, // tells AdonisJS the body is JSON
       body: JSON.stringify(updatedData)
     })
 
+    // fetch() only throws on network failures. HTTP errors such as 404 (task
+    // not found) or 422 (validation failed) still resolve, so check response.ok.
     if (!response.ok) {
-      alert('Failed to update task. Please try again.')
+      // Try to show the server's own message (e.g. a validation error). The body
+      // might not be JSON, so fall back to a generic message with the status code.
+      const errorBody = await response.json().catch(() => null)
+      showToast('error', errorBody?.message || `Failed to update task (${response.status}).`)
       return false
     }
 
-    await fetchTasks() // Refresh tasks after update
+    // Refetch instead of patching the local copy, so the list always matches the
+    // database and still respects the current filters. For example, marking a task
+    // "Completed" while filtering by "To Do" should make it disappear from view.
+    // The task also moves between the open list and "Completed tasks" automatically,
+    // because those lists are computed from the refreshed data.
+    await fetchTasks()
     return true
   } catch (error) {
+    // Network-level failure: the backend is down or unreachable.
     console.error('Error updating task:', error)
-    alert('Could not reach the server.')
+    showToast('error', 'Could not reach the server.')
     return false
   }
 }
 
+/**
+ * Status dropdown handler. Sends only the new status in the PATCH body.
+ * If the save fails, refetch so the dropdown snaps back to the saved value
+ * instead of showing a status that was never stored.
+ */
 const changeStatus = async (task, status) => {
+  // Completed tasks are locked. The dropdown is hidden for them, but guard anyway.
+  if (isLocked(task)) {
+    showToast('error', 'Completed tasks can’t be changed.')
+    return
+  }
+
   const ok = await updateTask(task.id, { status })
-  if (!ok) fetchTasks() // reset the dropdown to the saved value
+  if (ok) showToast('success', `Moved "${task.title}" to ${status}`)
+  else fetchTasks() // reset the dropdown to the saved value
 }
 
+/**
+ * Open the inline edit form for one task. We copy the task into editForm
+ * (instead of binding the inputs to the task itself) so that Cancel can throw
+ * the changes away without touching the list.
+ */
 const startEdit = (task) => {
+  // Completed tasks can't be edited (the Edit button is hidden for them too)
+  if (isLocked(task)) {
+    showToast('error', 'Completed tasks can’t be edited.')
+    return
+  }
+
   editingId.value = task.id
+  editOriginalDue.value = getDueDate(task)
   editForm.value = {
     title: task.title,
     description: task.description || '',
-    dueDate: (task.due_date || task.dueDate || '').split('T')[0],
+    dueDate: getDueDate(task), // <input type="date"> needs "YYYY-MM-DD"
     priority: task.priority || ''
   }
 }
@@ -126,29 +299,91 @@ const cancelEdit = () => {
   editingId.value = null
 }
 
+/**
+ * Save the edit form. Unlike the status dropdown, this sends all the editable
+ * fields in one PATCH request.
+ *
+ * - The API expects snake_case, so dueDate is sent as due_date.
+ * - Empty date or priority is sent as null (not ""), so the database clears the
+ *   value rather than storing an empty string that would fail date validation.
+ * - The edit form only closes when the save succeeded, so the user's changes
+ *   aren't lost if the request fails.
+ */
 const saveEdit = async (taskId) => {
-  if (!editForm.value.title.trim()) return alert('Title is required')
+  // Completed tasks are locked, so never send a PATCH for them
+  const current = tasks.value.find((t) => t.id === taskId)
+  if (current && isLocked(current)) {
+    return showToast('error', 'Completed tasks can’t be edited.')
+  }
+
+  // Client-side checks first so we don't send a request that will be rejected
+  if (!editForm.value.title.trim()) {
+    return showToast('error', 'Title is required')
+  }
+
+  // No moving a due date into the past. Keeping the task's existing (already
+  // past) date is fine, so overdue tasks can still be edited.
+  if (isPastDate(editForm.value.dueDate) && editForm.value.dueDate !== editOriginalDue.value) {
+    return showToast('error', 'Due date can’t be in the past. Pick today or a later date.')
+  }
 
   const ok = await updateTask(taskId, {
-    title: editForm.value.title,
+    title: editForm.value.title.trim(),
     description: editForm.value.description,
     due_date: editForm.value.dueDate || null,
     priority: editForm.value.priority || null
   })
 
-  if (ok) cancelEdit()
+  if (ok) {
+    cancelEdit()
+    showToast('success', 'Task updated')
+  }
 }
 
-// POST: Send new task to AdonisJS
+// ---------------------------------------------------------------------------
+// POST: send a new task to AdonisJS (from the "Add task" modal)
+// ---------------------------------------------------------------------------
+const resetNewTask = () => {
+  newTask.value = { title: '', description: '', dueDate: '', priority: '' }
+  addError.value = ''
+}
+
+const openAddModal = async () => {
+  resetNewTask()
+  showAddModal.value = true
+  await nextTick()
+  newTitleInput.value?.focus() // start typing right away
+}
+
+const closeAddModal = () => {
+  if (saving.value) return // block closing while the request is in flight
+  showAddModal.value = false
+  resetNewTask()
+}
+
 const submitTask = async () => {
-  if (!newTask.value.title) return alert('Title is required')
+  if (saving.value) return
+  if (!newTask.value.title.trim()) {
+    addError.value = 'Title is required'
+    return
+  }
+
+  // New tasks can be due today or later, never in the past. The date picker's
+  // min attribute blocks this too, but typing a date by hand can bypass it.
+  if (isPastDate(newTask.value.dueDate)) {
+    addError.value = 'Due date can’t be in the past. Pick today or a later date.'
+    return
+  }
+
+  saving.value = true
+  addError.value = ''
 
   try {
     const response = await fetch(`${API}/tasks`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        title: newTask.value.title,
+        title: newTask.value.title.trim(),
         description: newTask.value.description,
         due_date: newTask.value.dueDate,
         priority: newTask.value.priority
@@ -158,23 +393,27 @@ const submitTask = async () => {
     if (!response.ok) {
       const body = await response.json().catch(() => null)
       throw new Error(body?.message || `server responded with ${response.status}`)
-      const errorBody = await response.text()
-      console.error('PATCH failed:', response.status, errorBody)
-      alert(`Failed to update task (${response.status}). Check the console.`)
-      return false
     }
 
-    // Clear form and refresh board (under the current filters)
-    newTask.value = { title: '', description: '', dueDate: '', priority: '' }
+    // Success: close the modal, show the new task in the open list, and refresh
+    // (under the current filters)
+    showAddModal.value = false
+    resetNewTask()
+    activeTab.value = 'active'
     showToast('success', 'Task created')
     await fetchTasks()
   } catch (error) {
-    showToast('error', `Could not save the task: ${error.message}`)
+    // Keep the modal open so the user's input isn't lost
+    addError.value = `Could not save the task: ${error.message}`
     console.error('Error creating task:', error)
+  } finally {
+    saving.value = false
   }
 }
 
-// DELETE: safe delete 
+// ---------------------------------------------------------------------------
+// DELETE: safe delete (confirmation modal)
+// ---------------------------------------------------------------------------
 const requestDelete = (task) => {
   taskToDelete.value = task
   deleteError.value = ''
@@ -223,11 +462,12 @@ const confirmDelete = async () => {
   }
 }
 
-// Esc closes the modal
+// Esc closes whichever modal is open (delete confirmation first)
 const onKeydown = (event) => {
-  if (event.key === 'Escape') closeDeleteModal()
+  if (event.key !== 'Escape') return
+  if (taskToDelete.value) closeDeleteModal()
+  else if (showAddModal.value) closeAddModal()
 }
-
 
 // Load tasks when the page loads
 onMounted(() => {
@@ -242,237 +482,457 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="min-h-screen bg-gray-50 p-8 font-sans">
-    <div class="max-w-3xl mx-auto">
-      <div class="border-b border-gray-200 pb-4 mb-8">
-        <h1 class="text-3xl font-bold text-gray-900">Team To-Do List</h1>
-        <p class="text-gray-500 mt-2">Manage and track your project tasks.</p>
+  <!--
+    The page itself never scrolls: the root is pinned to the viewport (fixed
+    inset-0) and only the task list inside the card scrolls.
+  -->
+  <div class="fixed inset-0 overflow-hidden bg-gradient-to-br from-violet-50 via-violet-50 to-violet-100 font-sans">
+    <div class="mx-auto flex h-full w-full max-w-3xl flex-col p-3 sm:p-6">
+      <!-- Header -->
+      <div class="mb-3 flex shrink-0 items-center justify-between gap-3 sm:mb-5">
+        <div class="min-w-0">
+          <h1 class="truncate text-2xl font-bold text-gray-900 sm:text-3xl">Team To-Do List</h1>
+          <p class="mt-1 hidden text-sm text-gray-500 sm:block">Manage and track your project tasks.</p>
+        </div>
+        <button
+          type="button"
+          @click="openAddModal"
+          class="inline-flex shrink-0 items-center gap-1.5 rounded-lg bg-violet-600 px-4 py-2.5 text-sm font-medium text-white shadow-sm transition-colors hover:bg-violet-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+            <path fill-rule="evenodd" d="M10 3a1 1 0 011 1v5h5a1 1 0 110 2h-5v5a1 1 0 11-2 0v-5H4a1 1 0 110-2h5V4a1 1 0 011-1z" clip-rule="evenodd" />
+          </svg>
+          Add task
+        </button>
       </div>
 
-      <!-- Create Task Form -->
-      <div class="bg-white p-6 rounded-xl shadow-sm border border-gray-100 mb-8">
-        <h2 class="text-lg font-semibold mb-4 text-gray-800">Add a New Task</h2>
-        <form @submit.prevent="submitTask" class="space-y-4">
-          <div>
-            <label class="block text-sm font-medium text-gray-700 mb-1">Task Title *</label>
-            <input v-model="newTask.title" type="text" required class="block w-full border border-gray-300 rounded-lg p-2.5 focus:ring-blue-500 focus:border-blue-500" placeholder="What needs to be done?" />
-          </div>
-          
-          <div>
-            <label class="block text-sm font-medium text-gray-700 mb-1">Description</label>
-            <textarea v-model="newTask.description" rows="2" class="block w-full border border-gray-300 rounded-lg p-2.5 focus:ring-blue-500 focus:border-blue-500" placeholder="Optional details..."></textarea>
-          </div>
-
-          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1">Due Date</label>
-              <input v-model="newTask.dueDate" type="date" class="block w-full border border-gray-300 rounded-lg p-2.5 focus:ring-blue-500 focus:border-blue-500" />
+      <!-- Main card: filters + tabs on top, scrolling task list below -->
+      <div class="flex min-h-0 flex-1 flex-col overflow-hidden rounded-2xl border border-violet-100 bg-white shadow-lg shadow-violet-200/40">
+        <!-- Card header: filters and tabs (never scroll away) -->
+        <div class="shrink-0 space-y-3 border-b border-violet-100 bg-violet-50/50 p-3 sm:p-4">
+          <!-- Filters -->
+          <div class="grid grid-cols-2 gap-2 sm:flex sm:items-end sm:gap-3">
+            <div class="sm:flex-1">
+              <label for="filter-status" class="mb-1 block text-xs font-medium text-gray-500">Status</label>
+              <select id="filter-status" v-model="filters.status" class="block w-full rounded-lg border border-gray-300 bg-white p-2 text-sm focus:border-violet-500 focus:ring-violet-500">
+                <option value="">All statuses</option>
+                <option value="To Do">To Do</option>
+                <option value="In Progress">In Progress</option>
+                <option value="Completed">Completed</option>
+              </select>
             </div>
-            <div>
-              <label class="block text-sm font-medium text-gray-700 mb-1">Priority</label>
-              <select v-model="newTask.priority" class="block w-full border border-gray-300 rounded-lg p-2.5 focus:ring-blue-500 focus:border-blue-500">
-                <option value=""></option>
-                <option value="Low">Low</option>
-                <option value="Medium">Medium</option>
+
+            <div class="sm:flex-1">
+              <label for="filter-priority" class="mb-1 block text-xs font-medium text-gray-500">Priority</label>
+              <select id="filter-priority" v-model="filters.priority" class="block w-full rounded-lg border border-gray-300 bg-white p-2 text-sm focus:border-violet-500 focus:ring-violet-500">
+                <option value="">All priorities</option>
                 <option value="High">High</option>
+                <option value="Medium">Medium</option>
+                <option value="Low">Low</option>
               </select>
             </div>
-          </div>
 
-          <div class="flex justify-end pt-2">
-            <button type="submit" class="bg-blue-600 text-white font-medium px-6 py-2.5 rounded-lg hover:bg-blue-700 transition-colors">
-              Save Task
-            </button>
-          </div>
-        </form>
-      </div>
-
-      <!-- Feedback toast -->
-      <div
-        v-if="toast"
-        :class="toastClass"
-        class="mb-4 flex items-start justify-between gap-4 rounded-lg border px-4 py-3 text-sm"
-        role="status"
-      >
-        <span>{{ toast.text }}</span>
-        <button type="button" @click="toast = null" class="font-bold opacity-60 hover:opacity-100" aria-label="Dismiss">&times;</button>
-      </div>
-
-      <!-- Load failure -->
-      <div v-if="fetchError" class="mb-4 flex items-center justify-between gap-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
-        <span>{{ fetchError }}</span>
-        <button type="button" @click="fetchTasks" class="font-medium underline hover:text-red-900">Retry</button>
-      </div>
-
-      <!-- Filters -->
-      <div class="mb-6 flex flex-col gap-4 rounded-xl border border-gray-100 bg-white p-4 shadow-sm sm:flex-row sm:items-end">
-        <div class="flex-1">
-          <label for="filter-status" class="mb-1 block text-xs font-medium text-gray-500">Status</label>
-          <select id="filter-status" v-model="filters.status" class="block w-full rounded-lg border border-gray-300 p-2.5 text-sm focus:border-blue-500 focus:ring-blue-500">
-            <option value="">All statuses</option>
-            <option value="To Do">To Do</option>
-            <option value="In Progress">In Progress</option>
-            <option value="Completed">Completed</option>
-          </select>
-        </div>
-
-        <div class="flex-1">
-          <label for="filter-priority" class="mb-1 block text-xs font-medium text-gray-500">Priority</label>
-          <select id="filter-priority" v-model="filters.priority" class="block w-full rounded-lg border border-gray-300 p-2.5 text-sm focus:border-blue-500 focus:ring-blue-500">
-            <option value="">All priorities</option>
-            <option value="High">High</option>
-            <option value="Medium">Medium</option>
-            <option value="Low">Low</option>
-          </select>
-        </div>
-
-        <label class="flex cursor-pointer items-center gap-2 pb-2.5 text-sm text-gray-700">
-          <input v-model="filters.overdue" type="checkbox" class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500" />
-          Overdue only
-        </label>
-
-        <div class="flex items-center gap-3 pb-0.5">
-          <span class="text-sm text-gray-500">{{ tasks.length }} {{ tasks.length === 1 ? 'task' : 'tasks' }}</span>
-          <button v-if="hasActiveFilters" type="button" @click="clearFilters" class="text-sm font-medium text-blue-600 hover:text-blue-700 hover:underline">
-            Clear filters
-          </button>
-        </div>
-      </div>
-
-      <!-- Loading -->
-      <div v-if="loading" class="mb-4 py-4 text-center text-sm text-gray-500">Loading tasks&hellip;</div>
-
-      <!-- Task List Display -->
-      <div class="space-y-4">
-        <div v-for="task in tasks" :key="task.id" 
-             class="bg-white p-5 rounded-xl shadow-sm border-l-4 flex flex-col sm:flex-row sm:justify-between sm:items-start" 
-             :class="task.priority === 'High' ? 'border-red-500' : task.priority === 'Medium' ? 'border-yellow-500' : task.priority === 'Low' ? 'border-green-500' : 'border-gray-300'">
-          
-          <!-- Left Side: Task Data -->
-          <div class="flex-1">
-            <h3 class="font-bold text-lg text-gray-900">{{ task.title }}</h3>
-            <p class="text-gray-600 text-sm mt-1" v-if="task.description">{{ task.description }}</p>
-            
-            <div class="mt-4 flex flex-wrap gap-4 text-xs font-medium text-gray-600">
-              <span>Status: <strong class="text-gray-900">{{ task.status }}</strong></span>
-              
-              <span v-if="task.priority">Priority: <strong class="text-gray-900">{{ task.priority }}</strong></span>
-              
-              <span v-if="task.due_date || task.dueDate">
-                Due: <strong class="text-gray-900">{{ (task.due_date || task.dueDate).split('T')[0] }}</strong>
-              </span>
-            </div>  
-          </div>      
-
-          <!-- Right Side: Action Area for Teammates -->
-
-          <div class="mt-4 sm:mt-0 sm:ml-4 flex gap-2">
-            <!-- Teammate 1 will add Edit/Status dropdown here -->
-
-            <!-- Safe delete -->
-            <button
-              type="button"
-              @click="requestDelete(task)"
-              :disabled="deleting"
-              title="Delete task"
-              class="inline-flex items-center gap-1.5 rounded-lg border border-red-200 px-3 py-2 text-sm font-medium text-red-600 transition-colors hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
-                <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd" />
-              </svg>
-              Delete
-            </button>
-            <!-- Edit/Status (PATCH) -->
-            <div v-if="editingId !== task.id" class="flex gap-2 items-start">
-              <select
-                :value="task.status"
-                @change="changeStatus(task, $event.target.value)"
-                class="border border-gray-300 rounded-lg p-1.5 text-xs focus:ring-blue-500 focus:border-blue-500"
-              >
-                <option v-for="s in statuses" :key="s" :value="s">{{ s }}</option>
-              </select>
-              <button
-                @click="startEdit(task)"
-                class="text-xs font-medium px-3 py-1.5 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100"
-              >
-                Edit
+            <div class="col-span-2 flex items-center justify-between gap-3 sm:col-span-1 sm:justify-start sm:pb-2">
+              <label class="flex cursor-pointer items-center gap-2 text-sm text-gray-700">
+                <input v-model="filters.overdue" type="checkbox" class="h-4 w-4 rounded border-gray-300 text-violet-600 focus:ring-violet-500" />
+                Overdue only
+              </label>
+              <button v-if="hasActiveFilters" type="button" @click="clearFilters" class="whitespace-nowrap text-sm font-medium text-violet-600 hover:text-violet-700 hover:underline">
+                Clear filters
               </button>
             </div>
+          </div>
 
-            <div v-else class="w-full sm:w-64 space-y-2">
-              <input v-model="editForm.title" type="text" placeholder="Title"
-                class="block w-full border border-gray-300 rounded-lg p-1.5 text-sm" />
-              <textarea v-model="editForm.description" rows="2" placeholder="Description"
-                class="block w-full border border-gray-300 rounded-lg p-1.5 text-sm"></textarea>
-              <input v-model="editForm.dueDate" type="date"
-                class="block w-full border border-gray-300 rounded-lg p-1.5 text-sm" />
-              <select v-model="editForm.priority"
-                class="block w-full border border-gray-300 rounded-lg p-1.5 text-sm">
+          <!-- Tabs: open tasks vs. Completed tasks (history) -->
+          <div class="flex gap-1 rounded-lg bg-violet-100/70 p-1" role="tablist" aria-label="Task lists">
+            <button
+              type="button"
+              role="tab"
+              :aria-selected="activeTab === 'active'"
+              @click="activeTab = 'active'"
+              class="flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500"
+              :class="activeTab === 'active' ? 'bg-white text-violet-700 shadow-sm' : 'text-gray-600 hover:text-violet-700'"
+            >
+              Tasks <span class="ml-1 text-xs font-semibold opacity-70">{{ activeTasks.length }}</span>
+            </button>
+            <button
+              type="button"
+              role="tab"
+              :aria-selected="activeTab === 'completed'"
+              @click="activeTab = 'completed'"
+              class="flex-1 rounded-md px-3 py-1.5 text-sm font-medium transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500"
+              :class="activeTab === 'completed' ? 'bg-white text-violet-700 shadow-sm' : 'text-gray-600 hover:text-violet-700'"
+            >
+              Completed tasks <span class="ml-1 text-xs font-semibold opacity-70">{{ completedTasks.length }}</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Scrolling task list: the only part of the page that scrolls -->
+        <div
+          class="min-h-0 flex-1 space-y-3 overflow-y-auto p-3 [scrollbar-color:#c4b5fd_transparent] [scrollbar-width:thin] sm:p-4"
+          role="tabpanel"
+        >
+          <!-- Load failure -->
+          <div v-if="fetchError" class="flex items-center justify-between gap-4 rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800" role="alert">
+            <span>{{ fetchError }}</span>
+            <button type="button" @click="fetchTasks" class="font-medium underline hover:text-red-900">Retry</button>
+          </div>
+
+          <!-- Loading -->
+          <div v-if="loading" class="flex items-center justify-center gap-2 py-3 text-sm text-gray-500" role="status">
+            <svg class="h-4 w-4 animate-spin text-violet-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" aria-hidden="true">
+              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path>
+            </svg>
+            Loading tasks&hellip;
+          </div>
+
+          <!-- Task cards -->
+          <div
+            v-for="task in visibleTasks"
+            :key="task.id"
+            class="rounded-xl border-l-4 bg-white p-4 shadow-sm ring-1 ring-violet-100 transition-shadow hover:shadow-md"
+            :class="[priorityBorder(task.priority), task.status === 'Completed' ? 'opacity-75' : '']"
+          >
+            <!-- View mode -->
+            <div v-if="editingId !== task.id" class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <!-- Left side: task data -->
+              <div class="min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-2">
+                  <h3
+                    class="break-words text-lg font-bold"
+                    :class="task.status === 'Completed' ? 'text-gray-500 line-through' : 'text-gray-900'"
+                  >
+                    {{ task.title }}
+                  </h3>
+                  <span
+                    v-if="isOverdue(task)"
+                    class="inline-flex items-center rounded-full bg-red-50 px-2 py-0.5 text-xs font-semibold text-red-700 ring-1 ring-inset ring-red-200"
+                  >
+                    Overdue
+                  </span>
+                </div>
+
+                <p v-if="task.description" class="mt-1 break-words text-sm text-gray-600">{{ task.description }}</p>
+
+                <div class="mt-3 flex flex-wrap items-center gap-2 text-xs font-medium">
+                  <span
+                    class="inline-flex items-center rounded-full px-2.5 py-1 ring-1 ring-inset"
+                    :class="statusBadge(task.status)"
+                  >
+                    {{ task.status }}
+                  </span>
+
+                  <span
+                    v-if="task.priority"
+                    class="inline-flex items-center rounded-full px-2.5 py-1 ring-1 ring-inset"
+                    :class="priorityPill(task.priority)"
+                  >
+                    {{ task.priority }} priority
+                  </span>
+
+                  <span
+                    v-if="getDueDate(task)"
+                    class="inline-flex items-center gap-1"
+                    :class="isOverdue(task) ? 'text-red-600' : 'text-gray-600'"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                      <path fill-rule="evenodd" d="M6 2a1 1 0 00-1 1v1H4a2 2 0 00-2 2v10a2 2 0 002 2h12a2 2 0 002-2V6a2 2 0 00-2-2h-1V3a1 1 0 10-2 0v1H7V3a1 1 0 00-1-1zm0 5a1 1 0 000 2h8a1 1 0 100-2H6z" clip-rule="evenodd" />
+                    </svg>
+                    Due {{ formatDate(getDueDate(task)) }}
+                  </span>
+                </div>
+              </div>
+
+              <!-- Right side: actions (status dropdown, Edit, Delete) -->
+              <div class="flex flex-wrap items-center gap-2 sm:flex-nowrap">
+                <!-- Completed tasks are locked: no status dropdown and no Edit button -->
+                <span
+                  v-if="isLocked(task)"
+                  class="inline-flex items-center gap-1 rounded-lg bg-violet-50 px-2.5 py-1.5 text-xs font-medium text-violet-700"
+                  title="Completed tasks can't be edited"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-3.5 w-3.5" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                    <path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd" />
+                  </svg>
+                  Locked
+                </span>
+
+                <select
+                  v-if="!isLocked(task)"
+                  :value="task.status"
+                  @change="changeStatus(task, $event.target.value)"
+                  :aria-label="`Change status of ${task.title}`"
+                  class="rounded-lg border border-gray-300 p-1.5 text-xs focus:border-violet-500 focus:ring-violet-500"
+                >
+                  <option v-for="s in statuses" :key="s" :value="s">{{ s }}</option>
+                </select>
+
+                <button
+                  v-if="!isLocked(task)"
+                  type="button"
+                  @click="startEdit(task)"
+                  class="rounded-lg border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 transition-colors hover:bg-violet-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500"
+                >
+                  Edit
+                </button>
+
+                <!-- Safe delete: opens the confirmation modal -->
+                <button
+                  type="button"
+                  @click="requestDelete(task)"
+                  :disabled="deleting"
+                  title="Delete task"
+                  class="inline-flex items-center gap-1.5 rounded-lg border border-red-200 px-3 py-1.5 text-xs font-medium text-red-600 transition-colors hover:bg-red-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor" aria-hidden="true">
+                    <path fill-rule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 012 0v6a1 1 0 11-2 0V8zm5-1a1 1 0 00-1 1v6a1 1 0 102 0V8a1 1 0 00-1-1z" clip-rule="evenodd" />
+                  </svg>
+                  Delete
+                </button>
+              </div>
+            </div>
+
+            <!-- Edit mode: full-width inline form (PATCH) -->
+            <div v-else class="space-y-3">
+              <h3 class="text-sm font-semibold text-gray-800">Edit task</h3>
+
+              <div>
+                <label :for="`edit-title-${task.id}`" class="mb-1 block text-xs font-medium text-gray-600">Title</label>
+                <input
+                  :id="`edit-title-${task.id}`"
+                  v-model="editForm.title"
+                  type="text"
+                  placeholder="Title"
+                  class="block w-full rounded-lg border border-gray-300 p-2 text-sm focus:border-violet-500 focus:ring-violet-500"
+                />
+              </div>
+
+              <div>
+                <label :for="`edit-desc-${task.id}`" class="mb-1 block text-xs font-medium text-gray-600">Description</label>
+                <textarea
+                  :id="`edit-desc-${task.id}`"
+                  v-model="editForm.description"
+                  rows="2"
+                  placeholder="Description"
+                  class="block w-full rounded-lg border border-gray-300 p-2 text-sm focus:border-violet-500 focus:ring-violet-500"
+                ></textarea>
+              </div>
+
+              <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div>
+                  <label :for="`edit-due-${task.id}`" class="mb-1 block text-xs font-medium text-gray-600">Due date</label>
+                  <input
+                    :id="`edit-due-${task.id}`"
+                    v-model="editForm.dueDate"
+                    type="date"
+                    :min="editMinDate"
+                    class="block w-full rounded-lg border border-gray-300 p-2 text-sm focus:border-violet-500 focus:ring-violet-500"
+                  />
+                </div>
+                <div>
+                  <label :for="`edit-priority-${task.id}`" class="mb-1 block text-xs font-medium text-gray-600">Priority</label>
+                  <select
+                    :id="`edit-priority-${task.id}`"
+                    v-model="editForm.priority"
+                    class="block w-full rounded-lg border border-gray-300 p-2 text-sm focus:border-violet-500 focus:ring-violet-500"
+                  >
+                    <option value="">No priority</option>
+                    <option value="Low">Low</option>
+                    <option value="Medium">Medium</option>
+                    <option value="High">High</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="flex justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  @click="cancelEdit"
+                  class="rounded-lg border border-gray-300 px-3 py-1.5 text-xs font-medium text-gray-700 hover:bg-violet-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  @click="saveEdit(task.id)"
+                  class="rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white shadow-sm hover:bg-violet-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2"
+                >
+                  Save changes
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Empty states -->
+          <div
+            v-if="!loading && !fetchError && visibleTasks.length === 0"
+            class="rounded-xl border border-dashed border-violet-200 bg-violet-50/40 px-4 py-10 text-center"
+          >
+            <p v-if="hasActiveFilters" class="text-gray-500">
+              {{ activeTab === 'completed' ? 'No completed tasks match your filters.' : 'No tasks match your filters.' }}
+            </p>
+            <p v-else-if="activeTab === 'completed'" class="text-gray-500">
+              No completed tasks yet. Tasks you finish will show up here.
+            </p>
+            <p v-else class="text-gray-500">No open tasks. Add one to get started.</p>
+
+            <button v-if="hasActiveFilters" type="button" @click="clearFilters" class="mt-3 text-sm font-medium text-violet-600 hover:underline">
+              Clear filters
+            </button>
+            <button
+              v-else-if="activeTab === 'active'"
+              type="button"
+              @click="openAddModal"
+              class="mt-3 text-sm font-medium text-violet-600 hover:underline"
+            >
+              Add task
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Feedback toast: floats over the page so it never pushes the layout -->
+    <div
+      v-if="toast"
+      :class="toastClass"
+      class="fixed left-1/2 top-3 z-[60] flex w-[calc(100%-1.5rem)] max-w-md -translate-x-1/2 items-start justify-between gap-4 rounded-lg border px-4 py-3 text-sm shadow-lg"
+      role="status"
+    >
+      <span>{{ toast.text }}</span>
+      <button type="button" @click="toast = null" class="font-bold opacity-60 hover:opacity-100" aria-label="Dismiss">&times;</button>
+    </div>
+
+    <!-- Add task modal -->
+    <div
+      v-if="showAddModal"
+      class="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-3 sm:items-center sm:p-4"
+      @click.self="closeAddModal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="add-task-title"
+    >
+      <div class="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl bg-white p-5 shadow-xl sm:p-6">
+        <h2 id="add-task-title" class="text-lg font-semibold text-gray-900">Add a new task</h2>
+
+        <form @submit.prevent="submitTask" class="mt-4 space-y-4">
+          <div>
+            <label for="new-title" class="mb-1 block text-sm font-medium text-gray-700">
+              Task title <span class="text-red-500" aria-hidden="true">*</span>
+            </label>
+            <input
+              id="new-title"
+              ref="newTitleInput"
+              v-model="newTask.title"
+              type="text"
+              required
+              class="block w-full rounded-lg border border-gray-300 p-2.5 transition-colors focus:border-violet-500 focus:ring-violet-500"
+              placeholder="What needs to be done?"
+            />
+          </div>
+
+          <div>
+            <label for="new-description" class="mb-1 block text-sm font-medium text-gray-700">Description</label>
+            <textarea
+              id="new-description"
+              v-model="newTask.description"
+              rows="2"
+              class="block w-full rounded-lg border border-gray-300 p-2.5 transition-colors focus:border-violet-500 focus:ring-violet-500"
+              placeholder="Optional details..."
+            ></textarea>
+          </div>
+
+          <div class="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div>
+              <label for="new-due" class="mb-1 block text-sm font-medium text-gray-700">Due date</label>
+              <input
+                id="new-due"
+                v-model="newTask.dueDate"
+                type="date"
+                :min="todayString()"
+                class="block w-full rounded-lg border border-gray-300 p-2.5 transition-colors focus:border-violet-500 focus:ring-violet-500"
+              />
+            </div>
+            <div>
+              <label for="new-priority" class="mb-1 block text-sm font-medium text-gray-700">Priority</label>
+              <select
+                id="new-priority"
+                v-model="newTask.priority"
+                class="block w-full rounded-lg border border-gray-300 p-2.5 transition-colors focus:border-violet-500 focus:ring-violet-500"
+              >
                 <option value="">No priority</option>
                 <option value="Low">Low</option>
                 <option value="Medium">Medium</option>
                 <option value="High">High</option>
               </select>
-              <div class="flex justify-end gap-2">
-                <button @click="cancelEdit" class="text-xs px-3 py-1.5 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-100">Cancel</button>
-                <button @click="saveEdit(task.id)" class="text-xs px-3 py-1.5 rounded-lg bg-blue-600 text-white hover:bg-blue-700">Save</button>
-              </div>
             </div>
-
-            <!-- Teammate 2 will add Delete button here -->
           </div>
 
-        </div>
-
-        <!-- Empty State -->
-        <div v-if="!loading && !fetchError && tasks.length === 0" class="text-center py-10 bg-white rounded-xl border border-gray-200 border-dashed">
-          <p v-if="hasActiveFilters" class="text-gray-500">No tasks match your filters.</p>
-          <p v-else class="text-gray-500">No tasks found. Create one above to get started.</p>
-          <button v-if="hasActiveFilters" type="button" @click="clearFilters" class="mt-3 text-sm font-medium text-blue-600 hover:underline">
-            Clear filters
-          </button>
-        </div>
-      </div>
-
-      <!-- Delete confirmation modal -->
-      <div
-        v-if="taskToDelete"
-        class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
-        @click.self="closeDeleteModal"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="delete-task-title"
-      >
-        <div class="w-full max-w-md rounded-xl bg-white p-6 shadow-xl">
-          <h2 id="delete-task-title" class="text-lg font-semibold text-gray-900">Delete task?</h2>
-          <p class="mt-2 text-sm text-gray-600">
-            You're about to permanently delete
-            <strong class="text-gray-900">"{{ taskToDelete.title }}"</strong>.
-            This action can't be undone.
+          <p v-if="addError" class="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700" role="alert">
+            {{ addError }}
           </p>
 
-          <p v-if="deleteError" class="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-            {{ deleteError }}
-          </p>
-
-          <div class="mt-6 flex justify-end gap-3">
+          <div class="flex justify-end gap-3 pt-1">
             <button
               type="button"
-              @click="closeDeleteModal"
-              :disabled="deleting"
-              class="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+              @click="closeAddModal"
+              :disabled="saving"
+              class="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-violet-50 disabled:opacity-50"
             >
               Cancel
             </button>
             <button
-              type="button"
-              @click="confirmDelete"
-              :disabled="deleting"
-              class="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+              type="submit"
+              :disabled="saving"
+              class="rounded-lg bg-violet-600 px-5 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-violet-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 focus-visible:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {{ deleting ? 'Deleting…' : 'Delete task' }}
+              {{ saving ? 'Saving…' : 'Save task' }}
             </button>
           </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Delete confirmation modal -->
+    <div
+      v-if="taskToDelete"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      @click.self="closeDeleteModal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="delete-task-title"
+    >
+      <div class="w-full max-w-md rounded-xl bg-white p-6 shadow-xl">
+        <h2 id="delete-task-title" class="text-lg font-semibold text-gray-900">Delete task?</h2>
+        <p class="mt-2 text-sm text-gray-600">
+          You're about to permanently delete
+          <strong class="text-gray-900">"{{ taskToDelete.title }}"</strong>.
+          This action can't be undone.
+        </p>
+
+        <p v-if="deleteError" class="mt-3 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+          {{ deleteError }}
+        </p>
+
+        <div class="mt-6 flex justify-end gap-3">
+          <button
+            type="button"
+            @click="closeDeleteModal"
+            :disabled="deleting"
+            class="rounded-lg border border-gray-300 px-4 py-2 text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            @click="confirmDelete"
+            :disabled="deleting"
+            class="rounded-lg bg-red-600 px-4 py-2 text-sm font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {{ deleting ? 'Deleting…' : 'Delete task' }}
+          </button>
         </div>
       </div>
     </div>
