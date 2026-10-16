@@ -52,10 +52,16 @@ export default class TasksController {
   }
 
   // PATCH
-  async update({ params, request }: HttpContext) {
+  async update({ params, request, response, auth }: HttpContext) {
     const task = await Task.findOrFail(params.id)
 
     const { due_date, ...fields } = await request.validateUsing(updateTaskValidator)
+
+      // TODO: Uncomment once task ownership is implemented
+      // (also add `auth` to the destructured HttpContext above)
+      // if (task.userId !== auth.user!.id) {
+      //   return response.unauthorized({ message: 'You do not have permission to edit this task' })
+      // }
 
     task.merge(fields)
     if (due_date !== undefined) {
@@ -63,7 +69,7 @@ export default class TasksController {
     }
     await task.save()
 
-    return task.serialize()
+    return response.ok(task.serialize())
   }
 
   /**
