@@ -33,7 +33,6 @@ const activeTab = ref('active') // 'active' | 'completed'
 const showAddModal = ref(false)
 const saving = ref(false)
 const addTitleError = ref('')
-const addDateError = ref('')
 const newTitleInput = ref(null)
 
 // Safe delete flow
@@ -50,7 +49,6 @@ const editForm = ref({
   dueDate: '',
   priority: ''
 })
-const editOriginalDue = ref('') // due date when the edit started (see isPastDate rule)
 const editError = ref('') // inline validation message inside the edit modal
 const savingEdit = ref(false) // true while the PATCH request is in flight
 const editTitleInput = ref(null) // template ref, focused when the modal opens
@@ -91,11 +89,6 @@ const isOverdue = (task) => {
 
 // Past = before today (today is allowed)
 const isPastDate = (dateString) => Boolean(dateString) && dateString < todayString()
-
-// Earliest date the edit picker allows: today, or the task's own date if it's already overdue
-const editMinDate = computed(() =>
-  isPastDate(editOriginalDue.value) ? editOriginalDue.value : todayString()
-)
 
 // Completed tasks are read-only history: no edits, status changes or deletes
 const isLocked = (task) => task.status === 'Completed'
@@ -175,8 +168,11 @@ const fetchTasks = async () => {
   try {
     const params = new URLSearchParams()
     if (filters.value.status) params.set('status', filters.value.status)
-    if (filters.value.priority) params.set('priority', filters.value.priority)
-    if (filters.value.overdue) params.set('overdue', 'true')
+    if (filters.value.priority) params.set('priority', filters.value.priority === '__none__' ? 'none' : filters.value.priority)
+    if (filters.value.overdue) {
+      params.set('overdue', 'true')
+      params.set('overdue_before', todayString())
+    }
 
     const query = params.toString()
     const response = await fetch(`${API}/tasks${query ? `?${query}` : ''}`)
@@ -238,15 +234,24 @@ const updateTask = async (taskId, updatedData) => {
 
 // Status dropdown: PATCH only the new status
 const changeStatus = async (task, status) => {
-  // Completed tasks are read-only
+  // Completed tasks are read-only except for the explicit reopen action.
   if (isLocked(task)) {
-    showToast('error', 'Completed tasks can’t be changed.')
+    showToast('error', 'Use Reopen to restore this task.')
     return
   }
 
   const ok = await updateTask(task.id, { status })
   if (ok) showToast('success', `Moved "${task.title}" to ${status}`)
   else fetchTasks() // reset the dropdown to the saved value
+}
+
+const reopenTask = async (task) => {
+  if (!isLocked(task)) return
+
+  const savedStatus = task.previousStatus || task.previous_status
+  const status = statuses.includes(savedStatus) && savedStatus !== 'Completed' ? savedStatus : 'To Do'
+  const ok = await updateTask(task.id, { status })
+  if (ok) showToast('success', `Reopened "${task.title}" as ${status}`)
 }
 
 /**
@@ -263,7 +268,6 @@ const startEdit = async (task) => {
 
   editError.value = ''
   editingId.value = task.id
-  editOriginalDue.value = getDueDate(task)
   editForm.value = {
     title: task.title,
     description: task.description || '',
@@ -307,12 +311,6 @@ const saveEdit = async (taskId) => {
     return
   }
 
-  // Block new past dates (keeping an existing overdue date is fine)
-  if (isPastDate(editForm.value.dueDate) && editForm.value.dueDate !== editOriginalDue.value) {
-    editError.value = 'Due date can’t be in the past. Pick today or a later date.'
-    return
-  }
-
   savingEdit.value = true
   try {
     const ok = await updateTask(taskId, {
@@ -340,7 +338,6 @@ const saveEdit = async (taskId) => {
 const resetNewTask = () => {
   newTask.value = { title: '', description: '', dueDate: '', priority: '' }
   addTitleError.value = ''
-  addDateError.value = ''
 }
 
 const openAddModal = async () => {
@@ -363,15 +360,8 @@ const submitTask = async () => {
     return
   }
 
-  // Typing a date by hand can bypass the picker's min
-  if (isPastDate(newTask.value.dueDate)) {
-    addDateError.value = 'Due date can’t be in the past. Pick today or a later date.'
-    return
-  }
-
   saving.value = true
   addTitleError.value = ''
-  addDateError.value = ''
 
   try {
     const response = await fetch(`${API}/tasks`, {
@@ -481,8 +471,8 @@ onBeforeUnmount(() => {
     The page itself never scrolls: the root is pinned to the viewport (fixed
     inset-0) and only the task list inside the card scrolls.
   -->
-  <div class="fixed inset-0 overflow-hidden bg-gradient-to-br from-violet-50 via-violet-50 to-violet-100 font-sans">
-    <div class="mx-auto flex h-full w-full max-w-3xl flex-col p-3 sm:p-6">
+  <div class="fixed inset-0 overflow-hidden bg-gradient-to-br from-violet-50 via-violet-50 to-violet-100 font-sans" style="height: 100vh; height: 100dvh;">
+    <div class="mx-auto flex h-full w-full max-w-3xl flex-col pt-[max(0.75rem,env(safe-area-inset-top))] pr-[max(0.75rem,env(safe-area-inset-right))] pb-[max(0.75rem,env(safe-area-inset-bottom))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:pt-[max(1.5rem,env(safe-area-inset-top))] sm:pr-[max(1.5rem,env(safe-area-inset-right))] sm:pb-[max(1.5rem,env(safe-area-inset-bottom))] sm:pl-[max(1.5rem,env(safe-area-inset-left))]">
       <!-- Header -->
       <div class="mb-3 flex shrink-0 items-center justify-between gap-3 sm:mb-5">
         <div class="min-w-0">
@@ -508,7 +498,7 @@ onBeforeUnmount(() => {
           <!-- Filters -->
           <div class="grid grid-cols-2 gap-2 sm:flex sm:items-end sm:gap-3">
             <div class="sm:flex-1">
-              <label for="filter-status" class="mb-1 block text-xs font-medium text-gray-500">Status</label>
+              <label for="filter-status" class="mb-1 block text-sm text-gray-700">Status</label>
               <select id="filter-status" v-model="filters.status" class="block w-full rounded-lg border border-gray-300 bg-white p-2 text-sm focus:border-violet-500 focus:ring-violet-500">
                 <option value="">All statuses</option>
                 <option value="To Do">To Do</option>
@@ -518,9 +508,10 @@ onBeforeUnmount(() => {
             </div>
 
             <div class="sm:flex-1">
-              <label for="filter-priority" class="mb-1 block text-xs font-medium text-gray-500">Priority</label>
+              <label for="filter-priority" class="mb-1 block text-sm text-gray-700">Priority</label>
               <select id="filter-priority" v-model="filters.priority" class="block w-full rounded-lg border border-gray-300 bg-white p-2 text-sm focus:border-violet-500 focus:ring-violet-500">
                 <option value="">All priorities</option>
+                <option value="__none__">No priority</option>
                 <option value="High">High</option>
                 <option value="Medium">Medium</option>
                 <option value="Low">Low</option>
@@ -640,8 +631,17 @@ onBeforeUnmount(() => {
                 </div>
               </div>
 
-              <!-- Actions (completed tasks are read-only history, so none) -->
-              <div v-if="!isLocked(task)" class="flex flex-wrap items-center gap-2 sm:flex-nowrap">
+              <!-- Completed tasks can be reopened; other actions remain read-only. -->
+              <div v-if="isLocked(task)" class="flex flex-wrap items-center gap-2 sm:flex-nowrap">
+                <button
+                  type="button"
+                  @click="reopenTask(task)"
+                  class="rounded-lg border border-violet-200 px-3 py-1.5 text-xs font-medium text-violet-700 transition-colors hover:bg-violet-50 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500"
+                >
+                  Reopen
+                </button>
+              </div>
+              <div v-else class="flex flex-wrap items-center gap-2 sm:flex-nowrap">
                 <select
                   :value="task.status"
                   @change="changeStatus(task, $event.target.value)"
@@ -717,13 +717,13 @@ onBeforeUnmount(() => {
     <!-- Add task modal -->
     <div
       v-if="showAddModal"
-      class="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-3 sm:items-center sm:p-4"
+      class="fixed inset-0 z-50 flex items-end justify-center bg-black/40 pt-[max(0.75rem,env(safe-area-inset-top))] pr-[max(0.75rem,env(safe-area-inset-right))] pb-[max(0.75rem,env(safe-area-inset-bottom))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:items-center sm:pt-[max(1rem,env(safe-area-inset-top))] sm:pr-[max(1rem,env(safe-area-inset-right))] sm:pb-[max(1rem,env(safe-area-inset-bottom))] sm:pl-[max(1rem,env(safe-area-inset-left))]"
       @click.self="closeAddModal"
       role="dialog"
       aria-modal="true"
       aria-labelledby="add-task-title"
     >
-      <div class="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl bg-white p-5 shadow-xl sm:p-6">
+      <div class="w-full max-w-md overflow-y-auto rounded-xl bg-white p-5 shadow-xl sm:p-6" style="max-height: 90vh; max-height: 90dvh;">
         <h2 id="add-task-title" class="text-lg font-semibold text-gray-900">Add a new task</h2>
 
         <form @submit.prevent="submitTask" class="mt-4 space-y-4">
@@ -766,14 +766,11 @@ onBeforeUnmount(() => {
                 id="new-due"
                 v-model="newTask.dueDate"
                 type="date"
-                :min="todayString()"
-                @input="addDateError = ''"
-                aria-describedby="new-due-error"
-                class="block w-full rounded-lg border transition-colors p-2.5 focus:ring-1"
-                :class="addDateError ? 'border-red-300 focus:border-red-500 focus:ring-red-500' : 'border-gray-300 focus:border-violet-500 focus:ring-violet-500'"
+                aria-describedby="new-due-warning"
+                class="block w-full rounded-lg border border-gray-300 p-2.5 transition-colors focus:border-violet-500 focus:ring-violet-500"
               />
-              <p v-if="addDateError" id="new-due-error" class="mt-1 text-xs text-red-600" role="alert">
-                {{ addDateError }}
+              <p v-if="isPastDate(newTask.dueDate)" id="new-due-warning" class="mt-1 text-xs text-amber-700" role="status" aria-live="polite">
+                This date is in the past; the task will be marked overdue.
               </p>
             </div>
             <div>
@@ -815,13 +812,13 @@ onBeforeUnmount(() => {
     <!-- Edit task modal -->
     <div
       v-if="editingId !== null"
-      class="fixed inset-0 z-50 flex items-end justify-center bg-black/40 p-3 sm:items-center sm:p-4"
+      class="fixed inset-0 z-50 flex items-end justify-center bg-black/40 pt-[max(0.75rem,env(safe-area-inset-top))] pr-[max(0.75rem,env(safe-area-inset-right))] pb-[max(0.75rem,env(safe-area-inset-bottom))] pl-[max(0.75rem,env(safe-area-inset-left))] sm:items-center sm:pt-[max(1rem,env(safe-area-inset-top))] sm:pr-[max(1rem,env(safe-area-inset-right))] sm:pb-[max(1rem,env(safe-area-inset-bottom))] sm:pl-[max(1rem,env(safe-area-inset-left))]"
       @click.self="cancelEdit"
       role="dialog"
       aria-modal="true"
       aria-labelledby="edit-task-title"
     >
-      <div class="max-h-[90vh] w-full max-w-md overflow-y-auto rounded-xl bg-white p-5 shadow-xl sm:p-6">
+      <div class="w-full max-w-md overflow-y-auto rounded-xl bg-white p-5 shadow-xl sm:p-6" style="max-height: 90vh; max-height: 90dvh;">
         <h2 id="edit-task-title" class="text-lg font-semibold text-gray-900">Edit task</h2>
 
         <form @submit.prevent="saveEdit(editingId)" class="mt-4 space-y-4">
@@ -866,10 +863,13 @@ onBeforeUnmount(() => {
                 id="edit-due"
                 v-model="editForm.dueDate"
                 type="date"
-                :min="editMinDate"
                 :disabled="savingEdit"
+                aria-describedby="edit-due-warning"
                 class="block w-full rounded-lg border border-gray-300 p-2.5 transition-colors focus:border-violet-500 focus:ring-violet-500 disabled:opacity-60"
               />
+              <p v-if="isPastDate(editForm.dueDate)" id="edit-due-warning" class="mt-1 text-xs text-amber-700" role="status" aria-live="polite">
+                This date is in the past; the task will be marked overdue.
+              </p>
             </div>
             <div>
               <label for="edit-priority" class="mb-1 block text-sm font-medium text-gray-700">Priority</label>
@@ -911,13 +911,13 @@ onBeforeUnmount(() => {
     <!-- Delete confirmation modal -->
     <div
       v-if="taskToDelete"
-      class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
+      class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 pt-[max(1rem,env(safe-area-inset-top))] pr-[max(1rem,env(safe-area-inset-right))] pb-[max(1rem,env(safe-area-inset-bottom))] pl-[max(1rem,env(safe-area-inset-left))]"
       @click.self="closeDeleteModal"
       role="dialog"
       aria-modal="true"
       aria-labelledby="delete-task-title"
     >
-      <div class="w-full max-w-md rounded-xl bg-white p-6 shadow-xl">
+      <div class="w-full max-w-md overflow-y-auto rounded-xl bg-white p-6 shadow-xl" style="max-height: calc(100vh - 2rem); max-height: calc(100dvh - 2rem);">
         <h2 id="delete-task-title" class="text-lg font-semibold text-gray-900">Delete task?</h2>
         <p class="mt-2 text-sm text-gray-600">
           You're about to permanently delete

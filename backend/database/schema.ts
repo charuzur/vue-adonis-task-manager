@@ -49,6 +49,7 @@ export class TaskSchema extends BaseModel {
     'description',
     'dueDate',
     'id',
+    'previousStatus',
     'priority',
     'status',
     'title',
@@ -63,6 +64,8 @@ export class TaskSchema extends BaseModel {
   declare dueDate: DateTime | null
   @column({ isPrimary: true })
   declare id: number
+  @column()
+  declare previousStatus: string | null
   @column()
   declare priority: string | null
   @column()

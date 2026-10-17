@@ -20,6 +20,9 @@ export default class Task extends BaseModel {
   @column()
   declare status: string
 
+  @column()
+  declare previousStatus: string | null
+
   @column.dateTime({ autoCreate: true })
   declare createdAt: DateTime
 

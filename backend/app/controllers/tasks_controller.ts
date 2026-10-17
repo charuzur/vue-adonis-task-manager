@@ -9,7 +9,7 @@ export default class TasksController {
    * GET /tasks?status=completed&priority=high&overdue=true
    */
   async index({ request, response }: HttpContext) {
-    const { status, priority, overdue } = request.qs()
+    const { status, priority, overdue, overdue_before: overdueBefore } = request.qs()
 
     const query = Task.query()
 
@@ -18,14 +18,18 @@ export default class TasksController {
       query.where('status', status)
     }
 
-    // Filter by priority (e.g., 'low', 'medium', 'high')
-    if (priority) {
+    // Filter by priority; `none` represents tasks without an assigned priority.
+    if (priority === 'none') {
+      query.whereNull('priority')
+    } else if (priority) {
       query.where('priority', priority)
     }
 
-    // Filter for overdue tasks (due date is in the past and not completed)
+    // Use the browser's local calendar date so tasks due today are not overdue.
     if (overdue === 'true') {
-      query.where('dueDate', '<', DateTime.now().toSQL()).andWhereNot('status', 'completed')
+      const parsedDate = DateTime.fromISO(String(overdueBefore || ''), { zone: 'utc' })
+      const cutoff = (parsedDate.isValid ? parsedDate : DateTime.now()).startOf('day')
+      query.where('dueDate', '<', cutoff.toSQL()).andWhereNot('status', 'Completed')
     }
 
     // Fetch tasks ordered by creation date
@@ -52,20 +56,26 @@ export default class TasksController {
   }
 
   // PATCH
-  async update({ params, request, response, auth }: HttpContext) {
+  async update({ params, request, response }: HttpContext) {
     const task = await Task.findOrFail(params.id)
 
-    const { due_date, ...fields } = await request.validateUsing(updateTaskValidator)
+    const { due_date: dueDate, ...fields } = await request.validateUsing(updateTaskValidator)
 
-      // TODO: Uncomment once task ownership is implemented
-      // (also add `auth` to the destructured HttpContext above)
-      // if (task.userId !== auth.user!.id) {
-      //   return response.unauthorized({ message: 'You do not have permission to edit this task' })
-      // }
+    // TODO: Uncomment once task ownership is implemented
+    // (also add `auth` to the destructured HttpContext above)
+    // if (task.userId !== auth.user!.id) {
+    //   return response.unauthorized({ message: 'You do not have permission to edit this task' })
+    // }
+
+    if (fields.status === 'Completed' && task.status !== 'Completed') {
+      task.previousStatus = task.status
+    } else if (task.status === 'Completed' && fields.status && fields.status !== 'Completed') {
+      task.previousStatus = null
+    }
 
     task.merge(fields)
-    if (due_date !== undefined) {
-      task.dueDate = due_date
+    if (dueDate !== undefined) {
+      task.dueDate = dueDate
     }
     await task.save()
 
@@ -76,7 +86,7 @@ export default class TasksController {
    * Safely delete a task
    * DELETE /tasks/:id
    */
-  async destroy({ params, response, auth }: HttpContext) {
+  async destroy({ params, response }: HttpContext) {
     try {
       const task = await Task.findOrFail(params.id)
 
